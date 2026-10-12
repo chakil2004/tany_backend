@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from conftest import TEST_EMAIL, TEST_USER_ID
 
 
@@ -75,3 +77,29 @@ def test_get_infos_pro_unpublished_parcel_is_not_found(
 
     assert response.status_code == 404
     assert "georeport" not in fake_supabase.table_names
+
+
+def test_current_user_email_fallback_uses_supabase_auth(
+    client, fake_supabase, bearer_headers, monkeypatch
+):
+    headers = bearer_headers({"email": ""})
+    verified_tokens = []
+
+    def get_verified_user(token):
+        verified_tokens.append(token)
+        return SimpleNamespace(
+            user=SimpleNamespace(
+                id=TEST_USER_ID,
+                email=TEST_EMAIL,
+                user_metadata={},
+            )
+        )
+
+    monkeypatch.setattr(fake_supabase.auth, "get_user", get_verified_user)
+
+    response = client.get("/api/current_user", headers=headers)
+
+    assert response.status_code == 200
+    assert response.get_json()["data"]["email"] == TEST_EMAIL
+    # token_required validates once; the fallback retrieves the verified email.
+    assert len(verified_tokens) == 2

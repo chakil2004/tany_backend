@@ -248,7 +248,6 @@ def get_soil_data(longitude, latitude):
         response.raise_for_status()
         data = response.json()
         for i in data["properties"]["layers"]:
-            #print(i["name"])
             soil.append({"name" : i["name"], 
                         "unit_measure" : i["unit_measure"]["mapped_units"],
                         "values" : i["depths"][0]["values"]["mean"]})
@@ -282,9 +281,9 @@ def get_elevation(longitude, latitude):
         return elevation
 
     except requests.exceptions.RequestException as e:
-        print(f"An error occurred in elevation: {e}")
+        logger.warning("OpenTopoData elevation request failed (%s)", type(e).__name__)
     except (KeyError, IndexError):
-        print("Could not parse elevation data from the response.") 
+        logger.warning("Could not parse OpenTopoData elevation response")
 
 ###FLOOD###
 
@@ -531,16 +530,13 @@ def flood_risk(lat_str : str, lon_str: str):
         return {"error": "value_error", "message": error_code}
 
     except Exception as e:
-        print("Unexpected error for (%s, %s)", lat, lon)
+        logger.warning("Unexpected Open-Meteo Flood error (%s)", type(e).__name__)
         return {
             "error": "internal_error",
             "message": "An unexpected error occurred. Check server logs.",
         }
     
 ##TEST##
-#print(flood_risk("-18.1492", "49.4023")) #latitude=-18.1492, longitude=49.4023
-
-
 ###climate###
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -673,7 +669,6 @@ def season_analysis(longitude, latitude):
         f"&start={start}&end={end}&format=JSON"
     )
 
-    print(f"  Fetching NASA POWER data for ({latitude}, {longitude})...")
     resp = _batch_session.get(
         url,
         timeout=(5, 30),
@@ -809,7 +804,7 @@ def query_overpass(query):
                 raise ValueError("Invalid Overpass response structure")
             return data
         except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
-            logger.warning("Overpass request failed for %s: %s", server, exc)
+            logger.warning("Overpass request failed (%s)", type(exc).__name__)
             if server_index < len(servers) - 1:
                 time.sleep(0.25)
     return None
@@ -885,7 +880,6 @@ def proximity_analysis(latitude, longitude, radius=5000):
     if not (100 <= radius <= 10000):
         raise ValueError("radius must be between 100 and 10000 metres.")
 
-    print(f"  Querying Overpass for ({latitude}, {longitude}), radius={radius}m ...")
     data = query_overpass(build_query(latitude, longitude, radius))
 
     if data is None:
@@ -900,9 +894,6 @@ def proximity_analysis(latitude, longitude, radius=5000):
 
 
 #test 
-#print(season_analysis(49.4023, -18.1492))
-#print(proximity_analysis(-18.1492, 49.4023))
-
 ''' LIST OF TH FUNCTION THAT NEEDS TO BE ENTERED IN THE json
 1. ELEVATION : get_elevation(longitude, latitude)
 2. pentes : get_terrain_slope(lat, lon, distance=30)
@@ -913,10 +904,6 @@ def proximity_analysis(latitude, longitude, radius=5000):
 '''
 
 #elevation test
-#print(get_elevation(49.4023, -18.1492))
-#print(get_terrain_slope(-18.1492, 49.4023, distance=30))
-#print(get_soil_data(49.4023, -18.1492))
-
 class get_all_infos:
     def __init__(self, longitude: float, latitude : float, uuid_parcel):
         self.longitude = longitude
@@ -939,7 +926,7 @@ class get_all_infos:
         except requests.exceptions.RequestException as e:
             value["elevation"] = None
             ers["elevation"] = f"An error occurred in elevation: {e}"
-            logger.warning("OpenTopoData elevation request failed: %s", e)
+            logger.warning("OpenTopoData elevation request failed (%s)", type(e).__name__)
         except (KeyError, IndexError):
             value["elevation"] = None
             ers["elevation"] = "Could not parse elevation data from the response. (KeyError, IndexError)"
@@ -951,11 +938,11 @@ class get_all_infos:
             value.update(slopes)
             ers["slopes"] = "ok!"
         except requests.exceptions.RequestException as e:
-            print(f"An error occurred in slopes: {e}")
+            logger.warning("OpenTopoData slope request failed (%s)", type(e).__name__)
             #value.update(balise)
             ers["slopes"] = f"An error occurred in slopes: {e}"
         except (KeyError, IndexError):
-            print("Could not parse slopes data from the response.")
+            logger.warning("Could not parse OpenTopoData slope response")
             ers["slopes"] = "Could not parse slopes data from the response. (KeyError, IndexError)"
         
         #soil
@@ -991,13 +978,13 @@ class get_all_infos:
                 )
                 ers["soil"] = soil_error
                 ers["soil_value"] = soil_error
-                logger.warning("SoilGrids data unavailable: %s", soil_error)
+                logger.warning("SoilGrids data unavailable")
         except requests.exceptions.RequestException as e:
             value["soil_value"] = []
             soil_error = f"An error occurred in soil: {e}"
             ers["soil"] = soil_error
             ers["soil_value"] = soil_error
-            logger.warning("SoilGrids request failed: %s", e)
+            logger.warning("SoilGrids request failed (%s)", type(e).__name__)
         except (KeyError, IndexError):
             value["soil_value"] = []
             soil_error = "Could not parse soil data from the response. (KeyError, IndexError)"
@@ -1027,11 +1014,11 @@ class get_all_infos:
                     else "Flood service returned no valid flood data"
                 )
                 ers["flood"] = flood_error
-                logger.warning("Flood risk data unavailable: %s", flood_error)
+                logger.warning("Flood risk data unavailable")
         except requests.exceptions.RequestException as e:
             value["flood"] = None
             ers["flood"] = f"An error occurred in flood: {e}"
-            logger.warning("Flood risk request failed: %s", e)
+            logger.warning("Flood risk request failed (%s)", type(e).__name__)
         except (KeyError, IndexError):
             value["flood"] = None
             ers["flood"] = "Could not parse flood data from the response. (KeyError, IndexError)"
@@ -1043,10 +1030,10 @@ class get_all_infos:
             value["climates"] = climate
             ers["climates"] = "ok!"
         except requests.exceptions.RequestException as e:
-            print(f"An error occurred in climates: {e}")
+            logger.warning("NASA POWER climate request failed (%s)", type(e).__name__)
             ers["climates"] = f"An error occurred in climates: {e}"
         except (KeyError, IndexError):
-            print("Could not parse climates data from the response.") 
+            logger.warning("Could not parse NASA POWER climate response")
             ers["climates"] = "Could not parse climates data from the response. (KeyError, IndexError)"
 
         #proximity
@@ -1072,7 +1059,7 @@ class get_all_infos:
         except (RuntimeError, requests.exceptions.RequestException) as e:
             value["proximity"] = None
             ers["proximity"] = f"An error occurred in proximity: {e}"
-            logger.warning("Overpass proximity query failed: %s", e)
+            logger.warning("Overpass proximity query failed (%s)", type(e).__name__)
         
         return [
             self.uuid_parcel,
@@ -1089,4 +1076,3 @@ class get_all_infos:
 
 #BIG TEST
 #test = get_all_infos(49.4023, -18.1492, "uuid_test")
-#print(test.all_data())

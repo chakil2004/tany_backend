@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import jwt
 from functools import wraps
 import os
 from dotenv import load_dotenv
@@ -55,7 +54,6 @@ load_dotenv(os.path.join(basedir, '.env'))
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
-JWT_SECRET = os.getenv('SECRET_KEY')
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -81,27 +79,6 @@ def token_required(f):
         token = parts[1]
 
         try:
-            # IMPORTANT: For Supabase JWT tokens, we need to verify using the JWT secret
-            # Supabase uses JWKS (JSON Web Key Set) for verification
-            # Let's decode without verification first to see the token structure
-            unverified_token = jwt.decode(token, options={"verify_signature": False})
-            '''
-            unverified_token = jwt.decode(
-                                            token,
-                                            JWT_SECRET,
-                                            algorithms=["HS256"],
-                                            options={"verify_signature": True}  # True by default, explicitly set here for clarity
-                                        )
-                                        '''
-            print(f"Token payload: {json.dumps(unverified_token, indent=2)}")
-
-            # For Supabase tokens, we need to get the public key from Supabase
-            # Supabase tokens are signed with RS256 or ES256, not HS256
-
-            # For now, let's use a simpler approach - verify the user through Supabase
-            # Get user from the token using Supabase auth
-
-            # Try to get the user from Supabase using the token
             supabase_auth_response = supabase.auth.get_user(token)
 
             if not supabase_auth_response.user:
@@ -115,13 +92,9 @@ def token_required(f):
 
             current_user = profile_query.data[0]
 
-        except jwt.ExpiredSignatureError:
-            return jsonify({'success': False, 'message': 'Token has expired'}), 401
-        except jwt.InvalidTokenError as e:
-            return jsonify({'success': False, 'message': f'Invalid token: {str(e)}'}), 401
         except Exception as e:
-            print(f"Auth error: {str(e)}")
-            return jsonify({'success': False, 'message': f'Authentication error: {str(e)}'}), 401
+            app.logger.warning("Supabase token validation failed (%s)", type(e).__name__)
+            return jsonify({'success': False, 'message': 'Invalid or expired token'}), 401
 
         return f(current_user, *args, **kwargs)
 
@@ -148,8 +121,8 @@ def check_username():
             "username": username
         }), 200
 
-    except Exception as e:
-        print(f"Database error: {e}")
+    except Exception:
+        app.logger.exception("Username availability lookup failed")
         return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/api/parcels_w', methods=['POST', 'OPTIONS'])
@@ -192,7 +165,6 @@ def draw_parcels(current_user):
 
         # 4. Insert to Supabase
         # Changed table name to 'parcels' (Assuming 'profiles' was a typo)
-        print(parcel_d)
         response = supabase.table('main_parcels').insert(parcel_d).execute()
 
         return jsonify({
@@ -201,11 +173,11 @@ def draw_parcels(current_user):
             "data": response.data
         }), 201
 
-    except Exception as e:
-        print(f"Error: {e}") # This helps you debug in the terminal
+    except Exception:
+        app.logger.exception("Parcel creation failed")
         return jsonify({
             "success": False,
-            "message": str(e) # Returning the error message helps identify the cause
+            "message": "Failed to create parcel"
         }), 500
 
 @app.route('/api/messages_w', methods=['POST', 'OPTIONS'])
@@ -241,8 +213,8 @@ def write_messages(current_user):
             "data": response.data
         }), 201
 
-    except Exception as e:
-        print(f"Message insert error: {e}")
+    except Exception:
+        app.logger.exception("Message insertion failed")
         return jsonify({
             "success": False,
             "message": "Failed to send message"
@@ -258,26 +230,20 @@ def get_current_user_email(current_user):
         email = current_user.get('email')
 
         if not email:
-            # Try to extract from token as fallback
+            # Use Supabase Auth again for a verified identity fallback.
             auth_header = request.headers.get('Authorization')
             if auth_header:
                 parts = auth_header.split()
                 if parts[0].lower() == 'bearer' and len(parts) == 2:
                     token = parts[1]
-                    unverified_data = jwt.decode(token, options={"verify_signature": False})
-                    '''
-                    unverified_data = jwt.decode(
-                                    token,
-                                    JWT_SECRET,
-                                    algorithms=["HS256"],
-                                    options={"verify_signature": True}  # True by default, explicitly set here for clarity
-                                ) '''
-
+                    auth_user = supabase.auth.get_user(token).user
+                    user_metadata = getattr(auth_user, 'user_metadata', None)
+                    user_metadata = user_metadata if isinstance(user_metadata, dict) else {}
                     email = (
-                        unverified_data.get('email') or
-                        unverified_data.get('user_email') or
-                        unverified_data.get('user_metadata', {}).get('email') or
-                        unverified_data.get('sub')
+                        getattr(auth_user, 'email', None) or
+                        user_metadata.get('user_email') or
+                        user_metadata.get('email') or
+                        getattr(auth_user, 'id', None)
                     )
 
         if email:
@@ -298,11 +264,11 @@ def get_current_user_email(current_user):
                 'data': None
             }), 404
 
-    except Exception as e:
-        print(f"Error getting user email: {str(e)}")
+    except Exception:
+        app.logger.exception("Current user lookup failed")
         return jsonify({
             'success': False,
-            'message': f'Error retrieving user information: {str(e)}',
+            'message': 'Failed to retrieve user information',
             'data': None
         }), 500
 
@@ -398,10 +364,10 @@ def register():
                 'success': False,
                 'message': 'Email already exists'
             }), 409
-        print(f"Registration error: {error_message}")
+        app.logger.exception("Registration failed")
         return jsonify({
             'success': False,
-            'message': f'Registration failed: {error_message}'
+            'message': 'Registration failed'
         }), 500
 
 @app.route('/api/login', methods=['POST'])
@@ -451,10 +417,10 @@ def login():
                 'success': False,
                 'message': 'Invalid email or password'
             }), 401
-        print(f"Login error: {error_message}")
+        app.logger.exception("Login failed")
         return jsonify({
             'success': False,
-            'message': f'Login failed: {error_message}'
+            'message': 'Login failed'
         }), 500
 
 @app.route('/api/protected', methods=['GET'])
@@ -517,8 +483,8 @@ def get_messages(current_user):
             'success': True,
             'data': participant_messages
         }), 200
-    except Exception as e:
-        print(f"Message fetch error: {e}")
+    except Exception:
+        app.logger.exception("Message fetch failed")
         return jsonify({
             'success': False,
             'message': 'Failed to fetch messages'
@@ -544,8 +510,8 @@ def get_objects(current_user):
             'success': True,
             'data': result.data
         }), 200
-    except Exception as e:
-        print(f"Conversation list fetch error: {e}")
+    except Exception:
+        app.logger.exception("Conversation list fetch failed")
         return jsonify({
             'success': False,
             'message': 'Failed to fetch conversations'
@@ -580,8 +546,8 @@ def get_product(current_user):
             'data': result.data
         }), 200
 
-    except Exception as e:
-        print(f"Marketplace product lookup error: {str(e)}")
+    except Exception:
+        app.logger.exception("Marketplace product lookup failed")
         return jsonify({
             'success': False,
             'message': 'Failed to fetch marketplace listing'
@@ -603,11 +569,11 @@ def get_market(current_user):
             'data': result.data
         }), 200
 
-    except Exception as e:
-        print(f"Map data error: {str(e)}")
+    except Exception:
+        app.logger.exception("Marketplace map lookup failed")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch map data: {str(e)}'
+            'message': 'Failed to fetch marketplace data'
         }), 500
 
 @app.route('/api/update_t', methods=['GET', 'POST'])
@@ -665,11 +631,11 @@ def update_map_data(current_user):
             'data': result.data
         }), 200
 
-    except Exception as e:
-        print(f"Map data error: {str(e)}")
+    except Exception:
+        app.logger.exception("Parcel update failed")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch map data: {str(e)}'
+            'message': 'Failed to update parcel'
         }), 500
 # Example: Get user's map data (protected route)
 
@@ -688,11 +654,11 @@ def get_map_data(current_user):
             'data': result.data
         }), 200
 
-    except Exception as e:
-        print(f"Map data error: {str(e)}")
+    except Exception:
+        app.logger.exception("Parcel map lookup failed")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch map data: {str(e)}'
+            'message': 'Failed to fetch parcel map data'
         }), 500
 
 # Example: Get user's map data (protected route)
@@ -704,18 +670,16 @@ def get_map_account(current_user):
         # Example: fetch locations from Supabase that belong to the user
         #result = supabase.table('main_parcels').select('*').eq('owner_uuid', current_user['email']).execute() #changer pour la table profile
         result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
-        print(result.data)
-
         return jsonify({
             'success': True,
             'data': result.data
         }), 200
 
-    except Exception as e:
-        print(f"Map data error: {str(e)}")
+    except Exception:
+        app.logger.exception("Account profile lookup failed")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch map data: {str(e)}'
+            'message': 'Failed to fetch account information'
         }), 500
 
 @app.route('/api/logout', methods=['POST'])
@@ -729,10 +693,11 @@ def logout(current_user):
             'success': True,
             'message': 'Logout successful'
         }), 200
-    except Exception as e:
+    except Exception:
+        app.logger.exception("Logout failed")
         return jsonify({
             'success': False,
-            'message': f'Logout failed: {str(e)}'
+            'message': 'Logout failed'
         }), 500
 
 @app.route('/api/refresh-token', methods=['POST'])
@@ -825,7 +790,7 @@ def coordinates_to_geojson(coords_text, geometry_type):
                 }
 
     except (ValueError, IndexError) as e:
-        print(f"Error parsing coordinates: {e}")
+        app.logger.warning("KML coordinate parsing failed (%s)", type(e).__name__)
         return None
 
     return None
@@ -905,16 +870,17 @@ def store_parcel_in_supabase(form_data, geojson_geometry):
                 'message': 'Parcel data stored successfully'
             }
         else:
-            error_msg = getattr(response, 'error', 'Unknown error occurred')
+            app.logger.error("Supabase parcel insert returned no data")
             return {
                 'status': 'error',
-                'message': f'Failed to insert data into database: {error_msg}'
+                'message': 'Failed to store parcel'
             }
 
-    except Exception as e:
+    except Exception:
+        app.logger.exception("Parcel persistence failed")
         return {
             'status': 'error',
-            'message': f'Database error: {str(e)}'
+            'message': 'Failed to store parcel'
         }
 
 @app.route('/api/upload-kml', methods=['POST'])
@@ -1015,15 +981,17 @@ def upload_kml(current_user):
                     }
                 }), 200
             else:
+                app.logger.error("KML parcel persistence failed")
                 return jsonify({
                     'status': 'error',
-                    'message': result['message']
+                    'message': 'Failed to store parcel'
                 }), 500
 
         except ValueError as e:
+            app.logger.warning("KML parsing failed (%s)", type(e).__name__)
             return jsonify({
                 'status': 'error',
-                'message': str(e)
+                'message': 'Invalid KML file or geometry'
             }), 400
 
         finally:
@@ -1031,10 +999,11 @@ def upload_kml(current_user):
             if os.path.exists(temp_file_path):
                 os.unlink(temp_file_path)
 
-    except Exception as e:
+    except Exception:
+        app.logger.exception("KML upload failed")
         return jsonify({
             'status': 'error',
-            'message': f'Server error: {str(e)}'
+            'message': 'Failed to upload parcel'
         }), 500
 
 @app.route('/api/health', methods=['GET'])
@@ -1193,13 +1162,13 @@ def _get_external_json(url, service, params=None, ttl=None, retry_budget=None):
             response.raise_for_status()
             try:
                 return response.json()
-            except ValueError as error:
-                app.logger.warning("%s returned invalid JSON: %s", service, error)
+            except ValueError:
+                app.logger.warning("%s returned invalid JSON", service)
                 return None
         except (requests.Timeout, requests.ConnectionError) as error:
             if _consume_external_retry(retry_budget, service):
                 continue
-            app.logger.warning("%s request failed: %s", service, error)
+            app.logger.warning("%s request failed (%s)", service, type(error).__name__)
             return None
         except requests.HTTPError as error:
             response = error.response
@@ -1212,7 +1181,7 @@ def _get_external_json(url, service, params=None, ttl=None, retry_budget=None):
             app.logger.warning("%s returned HTTP status %s", service, status_code)
             return None
         except requests.RequestException as error:
-            app.logger.warning("%s request failed: %s", service, error)
+            app.logger.warning("%s request failed (%s)", service, type(error).__name__)
             return None
 
 
@@ -1467,11 +1436,11 @@ def great_info(current_user):
             'success': True,
             'data': result.data
         }), 200
-    except Exception as e:
-        print(f"Map data error: {str(e)}")
+    except Exception:
+        app.logger.exception("Stored GeoReport lookup failed")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch messages: {str(e)}'
+            'message': 'Failed to fetch GeoReport'
         }), 500
 
 '''end of the new fetching '''
@@ -1488,7 +1457,6 @@ def give_info(current_user):
     data = request.get_json() #format {"longitude": xx.xx , "latitude" : xx.xx}
     try:
         results = get_info(data.get("data"))
-        print(results)
         return jsonify({
                 'success': True,
                 'data': results,
@@ -1510,4 +1478,5 @@ def get_coords(current_user):
     return _deprecated_getcoords_response()
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    debug = os.getenv("FLASK_DEBUG", "").lower() == "true"
+    app.run(debug=debug, port=5000)
