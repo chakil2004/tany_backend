@@ -1098,6 +1098,34 @@ def export_kml(current_user):
 import requests
 import math
 
+EXTERNAL_API_TIMEOUT = (5, 10)  # connect timeout, read timeout (seconds)
+
+
+def _get_external_json(url, service, params=None):
+    """Fetch and decode one external JSON response with bounded wait time."""
+    try:
+        response = requests.get(url, params=params, timeout=EXTERNAL_API_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+    except requests.Timeout as error:
+        app.logger.warning("%s request timed out: %s", service, error)
+    except requests.ConnectionError as error:
+        app.logger.warning("%s connection failed: %s", service, error)
+    except ValueError as error:
+        app.logger.warning("%s returned invalid JSON: %s", service, error)
+    except requests.RequestException as error:
+        app.logger.warning("%s request failed: %s", service, error)
+    return None
+
+
+def _is_finite_number(value):
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
 def get_terrain_slope(lat, lon, distance=30):
     # 1. Calculate the 8 surrounding points
     # 1 degree of lat approx 111,320 meters
@@ -1120,8 +1148,19 @@ def get_terrain_slope(lat, lon, distance=30):
     locations_str = "|".join([f"{p[0]},{p[1]}" for p in points])
     url = f"https://api.opentopodata.org/v1/srtm90m?locations={locations_str}"
 
-    response = requests.get(url).json()
-    elevations = [r['elevation'] for r in response['results']]
+    response = _get_external_json(url, "OpenTopoData slope")
+    results = response.get('results') if isinstance(response, dict) else None
+    if not isinstance(results, list) or len(results) != len(points):
+        app.logger.warning("OpenTopoData slope returned an incomplete result set")
+        return None
+
+    elevations = []
+    for result in results:
+        elevation = result.get('elevation') if isinstance(result, dict) else None
+        if not _is_finite_number(elevation):
+            app.logger.warning("OpenTopoData slope returned a missing or invalid elevation")
+            return None
+        elevations.append(elevation)
 
     center_elev = elevations[0]
     surrounding_elevs = elevations[1:]
@@ -1157,86 +1196,120 @@ def get_soil_data(longitude, latitude):
         'value': 'mean'
     }
 
+    data = _get_external_json(url, "SoilGrids", params=params)
+    if not isinstance(data, dict):
+        return None
+
     try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        data = response.json()
-        for i in data["properties"]["layers"]:
-            #print(i["name"])
-            soil.append({"name" : i["name"],
-                        "unit_measure" : i["unit_measure"]["mapped_units"],
-                        "values" : i["depths"][0]["values"]["mean"]})
-
-
+        layers = data["properties"]["layers"]
+        for layer in layers:
+            soil.append({
+                "name": layer["name"],
+                "unit_measure": layer["unit_measure"]["mapped_units"],
+                "values": layer["depths"][0]["values"]["mean"],
+            })
         return soil
-
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Failed to fetch data: {str(e)}"}
-    except (KeyError, AttributeError) as e:
-        return {"error": f"Failed to parse API response: {str(e)}"}
+    except (KeyError, TypeError, IndexError):
+        app.logger.warning("SoilGrids returned an incomplete response")
+        return None
 
 def get_info(xy):
-    value = {}
-    #elevation
-    open_topo_api = "https://api.opentopodata.org/v1/srtm90m?locations={},{}&interpolation=cubic&format=json".format(xy["latitude"], xy["longitude"])
-    try:
-        # Send the GET request
-        response = requests.get(open_topo_api)
-
-        # Raise an exception if the request was unsuccessful
-        response.raise_for_status()
-
-        # Parse the JSON response
-        data = response.json()
-
-        # Access the elevation value
-        # The structure is typically {'results': [{'elevation': 123.4, ...}], 'status': 'OK'}
-        '''elevation addtiion'''
-        elevation = data['results'][0]['elevation']
-        value["elevation"] = elevation
-
-        '''slopes addition'''
-        slopes = get_terrain_slope(xy["latitude"], xy["longitude"], 30)
-        value.update(slopes)
-        '''
-        {
-        "max_slope": max(slopes),
-        "avg_slope": sum(slopes) / len(slopes),
-        "individual_slopes": slopes
+    latitude = xy["latitude"]
+    longitude = xy["longitude"]
+    value = {
+        "elevation": None,
+        "max_slope": None,
+        "avg_slope": None,
+        "individual_slopes": [],
+        "soil_value": [],
+        "flood": {
+            "coordinate": {"latitude": latitude, "longitude": longitude},
+            "flood_risk": None,
+            "forecast": {"peak_discharge_m3s": None, "days_checked": None},
+            "statistics": {"years_analyzed": None, "history_from": None, "thresholds_m3s": {}},
+            "data_source": "GloFAS v4 via Open-Meteo",
+            "assessed_on": None,
+        },
+        "climates": {},
+        "proximity": {
+            "query": {"lat": latitude, "lon": longitude, "radius_m": 5000},
+            "results": {"hospital": None, "market": None, "transport": None},
+        },
     }
-        '''
 
-        '''soil type addition'''
-        soil = get_soil_data(xy["longitude"], xy["latitude"])
+    # Elevation
+    open_topo_api = "https://api.opentopodata.org/v1/srtm90m?locations={},{}&interpolation=cubic&format=json".format(latitude, longitude)
+    data = _get_external_json(open_topo_api, "OpenTopoData elevation")
+    results = data.get("results") if isinstance(data, dict) else None
+    if isinstance(results, list) and results and isinstance(results[0], dict):
+        elevation = results[0].get("elevation")
+        if _is_finite_number(elevation):
+            value["elevation"] = elevation
+        else:
+            app.logger.warning("OpenTopoData elevation returned a missing or invalid elevation")
+    else:
+        app.logger.warning("OpenTopoData elevation returned an incomplete response")
+
+    # Slopes
+    slopes = get_terrain_slope(latitude, longitude, 30)
+    if isinstance(slopes, dict):
+        value.update(slopes)
+
+    # Soil properties
+    soil = get_soil_data(longitude, latitude)
+    if isinstance(soil, list):
         value["soil_value"] = soil
 
-        '''flood api '''
-        flink = "https://flood-tany.onrender.com/flood-risk?lat={}&lon={}".format(xy["latitude"], xy["longitude"])
-        flood_response = requests.get(flink)
-        flood = flood_response.json()
+    # Flood risk
+    flood = _get_external_json(
+        "https://flood-tany.onrender.com/flood-risk",
+        "flood-tany",
+        params={"lat": latitude, "lon": longitude},
+    )
+    flood_coordinate = flood.get("coordinate") if isinstance(flood, dict) else None
+    if (
+        isinstance(flood, dict)
+        and not flood.get("error")
+        and isinstance(flood_coordinate, dict)
+        and _is_finite_number(flood_coordinate.get("latitude"))
+        and _is_finite_number(flood_coordinate.get("longitude"))
+        and isinstance(flood.get("forecast"), dict)
+        and isinstance(flood.get("statistics"), dict)
+    ):
         value["flood"] = flood
+    elif flood is not None:
+        app.logger.warning("flood-tany returned an incomplete response")
 
-        '''climate api'''
-        clink = "https://tany-climate.onrender.com/api/season?longitude={}&latitude={}".format(xy["latitude"], xy["longitude"])
-        clink_res =  requests.get(clink)
-        climates = clink_res.json()
+    # Climate. Query parameter names and coordinate values use the same axis.
+    climates = _get_external_json(
+        "https://tany-climate.onrender.com/api/season",
+        "tany-climate season",
+        params={"longitude": longitude, "latitude": latitude},
+    )
+    if isinstance(climates, dict) and not climates.get("error"):
         value["climates"] = climates
+    elif climates is not None:
+        app.logger.warning("tany-climate season returned an incomplete response")
 
-        '''proximity'''
-        ### try to erase the comment status on 4th june
+    # Proximity
+    proximity = _get_external_json(
+        "https://tany-climate.onrender.com/api/proximity",
+        "tany-climate proximity",
+        params={"longitude": longitude, "latitude": latitude},
+    )
+    proximity_results = proximity.get("results") if isinstance(proximity, dict) else None
+    if (
+        isinstance(proximity, dict)
+        and not proximity.get("error")
+        and isinstance(proximity.get("query"), dict)
+        and isinstance(proximity_results, dict)
+        and all(isinstance(proximity_results.get(category), list) for category in ("hospital", "market", "transport"))
+    ):
+        value["proximity"] = proximity
+    elif proximity is not None:
+        app.logger.warning("tany-climate proximity returned an incomplete response")
 
-        proxi = "https://tany-climate.onrender.com/api/proximity?longitude={}&latitude={}".format(xy["latitude"], xy["longitude"])
-        proxi_res = requests.get(proxi)
-        proximi = proxi_res.json()
-        value["proximity"] = proximi
-
-        '''return the data'''
-        return value
-
-    except requests.exceptions.RequestException as e:
-        print(f"An error occurred: {e}")
-    except (KeyError, IndexError):
-        print("Could not parse elevation data from the response.")
+    return value
 
 
 '''add for statics in pythonanywhere: take data from supabase directly instead of fetching the api'''
@@ -1300,10 +1373,11 @@ def give_info(current_user):
                 'data': results,
                 'balise' : data.get("data")
             }), 200
-    except Exception as e:
+    except Exception:
+        app.logger.exception("GeoReport calculation failed")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch map data: {str(e)}'
+            'message': 'Failed to fetch map data'
         }), 500
 
 
