@@ -147,11 +147,17 @@ def draw_parcels(current_user):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
 
-    data = request.get_json()
+    owner_email = current_user.get('email') if isinstance(current_user, dict) else None
+    if not isinstance(owner_email, str) or not owner_email.strip():
+        return jsonify({'success': False, 'message': 'Authenticated profile has no email'}), 403
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'message': 'A JSON object is required'}), 400
 
     # 1. Validation & Extraction
     fields = ["owner", "price_m2", "price", "currency", "location_name",
-              "description", "owner_uuid", "sell_category","status_category", "longitude",
+              "description", "sell_category","status_category", "longitude",
               "latitude", "parcel_name", "geojson", "area_ha"]
 
     parcel_d = {}
@@ -161,6 +167,7 @@ def draw_parcels(current_user):
         if val is None or (isinstance(val, str) and val.strip() == ""):
             return jsonify({'success': False, 'message': f'{field} is required'}), 400
         parcel_d[field] = val
+    parcel_d['owner_uuid'] = owner_email
 
     try:
         # 2. Critical Fix: Convert geojson string to a Python Dict (JSONB in Postgres)
@@ -586,13 +593,49 @@ def get_market(current_user):
 @token_required
 def update_map_data(current_user):
     """Get map data for authenticated user"""
-    data = request.get_json()
-    print(data)
+    owner_email = current_user.get('email') if isinstance(current_user, dict) else None
+    if not isinstance(owner_email, str) or not owner_email.strip():
+        return jsonify({'success': False, 'message': 'Authenticated profile has no email'}), 403
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'message': 'A JSON object is required'}), 400
+
     received_value = data.get('element')
     rowid = data.get('id')
+    allowed_fields = {
+        'parcel_name', 'location_name', 'description', 'price', 'price_m2',
+        'currency', 'sell_category', 'status_category'
+    }
+    string_fields = {
+        'parcel_name', 'location_name', 'description', 'currency',
+        'sell_category', 'status_category'
+    }
+    numeric_fields = {'price', 'price_m2'}
+
+    if not isinstance(received_value, dict) or not received_value:
+        return jsonify({'success': False, 'message': 'element must be a non-empty object'}), 400
+    if rowid is None or isinstance(rowid, bool) or not isinstance(rowid, (str, int)) or (isinstance(rowid, str) and not rowid.strip()):
+        return jsonify({'success': False, 'message': 'A valid parcel id is required'}), 400
+    if any(field not in allowed_fields for field in received_value):
+        return jsonify({'success': False, 'message': 'element contains a non-editable field'}), 400
+
+    for field, value in received_value.items():
+        if field in string_fields and not isinstance(value, str):
+            return jsonify({'success': False, 'message': f'{field} must be a string'}), 400
+        if field in numeric_fields:
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                return jsonify({'success': False, 'message': f'{field} must be numeric'}), 400
+            try:
+                float(value)
+            except (TypeError, ValueError, OverflowError):
+                return jsonify({'success': False, 'message': f'{field} must be numeric'}), 400
+
     try:
         # Example: fetch locations from Supabase that belong to the user
-        result = supabase.table('main_parcels').update(received_value).eq('id', rowid).eq('owner_uuid', current_user['email']).execute() #changer pour la table profile
+        result = supabase.table('main_parcels').update(received_value).eq('id', rowid).eq('owner_uuid', owner_email).select('id').execute()
+        if not result.data:
+            return jsonify({'success': False, 'message': 'Parcel not found'}), 404
         #result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
 
 
@@ -858,6 +901,13 @@ def store_parcel_in_supabase(form_data, geojson_geometry):
 def upload_kml(current_user):
     """Handle KML file upload with parcel information"""
     try:
+        owner_email = current_user.get('email') if isinstance(current_user, dict) else None
+        if not isinstance(owner_email, str) or not owner_email.strip():
+            return jsonify({
+                'status': 'error',
+                'message': 'Authenticated profile has no email'
+            }), 403
+
         # Check if file is present in request
         if 'kmlFile' not in request.files:
             return jsonify({
@@ -884,7 +934,7 @@ def upload_kml(current_user):
         # Get form data
         form_data = {
             'owner': request.form.get('owner', '').strip(),
-            'owner_uuid': request.form.get('owner_uuid', '').strip(),
+            'owner_uuid': owner_email,
             'parcel_name': request.form.get('parcel_name', '').strip(),
             'location_name': request.form.get('location_name', '').strip(),
             'description': request.form.get('description', '').strip(),
@@ -897,7 +947,7 @@ def upload_kml(current_user):
         }
 
         # Validate required form fields
-        required_fields = ['owner', 'owner_uuid', 'parcel_name', 'location_name', 'sell_category', 'status_category']
+        required_fields = ['owner', 'parcel_name', 'location_name', 'sell_category', 'status_category']
         for field in required_fields:
             if not form_data[field]:
                 return jsonify({
