@@ -1,5 +1,6 @@
 import requests
 import math
+import logging
 
 from datetime import date
 from collections import defaultdict
@@ -18,6 +19,8 @@ from statistics import mean, stdev
 from math import radians, sin, cos, sqrt, atan2
 import time
 
+
+logger = logging.getLogger(__name__)
 
 
 def get_terrain_slope(lat, lon, distance=30):
@@ -751,16 +754,21 @@ class get_all_infos:
         #elevation 
         try:
             el = get_elevation(self.longitude, self.latitude)
-            value["elevation"] = el
-            ers["elevation"] = "ok!"
+            if isinstance(el, (int, float)) and not isinstance(el, bool) and math.isfinite(el):
+                value["elevation"] = el
+                ers["elevation"] = "ok!"
+            else:
+                value["elevation"] = None
+                ers["elevation"] = "OpenTopoData returned no valid elevation value"
+                logger.warning("OpenTopoData elevation returned no valid numeric value")
         except requests.exceptions.RequestException as e:
-            print(f"An error occurred in elevation: {e}")
-            #value["elevation"] = 0
+            value["elevation"] = None
             ers["elevation"] = f"An error occurred in elevation: {e}"
+            logger.warning("OpenTopoData elevation request failed: %s", e)
         except (KeyError, IndexError):
-            print("Could not parse elevation data from the response.") 
+            value["elevation"] = None
             ers["elevation"] = "Could not parse elevation data from the response. (KeyError, IndexError)"
-            #value["elevation"] = 0
+            logger.warning("Could not parse OpenTopoData elevation response")
         
         #slopes
         try:
@@ -778,27 +786,81 @@ class get_all_infos:
         #soil
         try:
             soil = get_soil_data(self.longitude, self.latitude)
-            #value.update(soil)
-            value["soil_value"] = soil
-            ers["soil"] = "ok!"
+            soil_is_valid = (
+                isinstance(soil, list)
+                and bool(soil)
+                and all(
+                    isinstance(item, dict)
+                    and {"name", "unit_measure", "values"}.issubset(item)
+                    and (
+                        item["values"] is None
+                        or (
+                            isinstance(item["values"], (int, float))
+                            and not isinstance(item["values"], bool)
+                            and math.isfinite(item["values"])
+                        )
+                    )
+                    for item in soil
+                )
+                and any(item["values"] is not None for item in soil)
+            )
+            if soil_is_valid:
+                value["soil_value"] = soil
+                ers["soil"] = "ok!"
+            else:
+                value["soil_value"] = []
+                soil_error = (
+                    str(soil["error"])
+                    if isinstance(soil, dict) and "error" in soil
+                    else "SoilGrids returned no valid soil data"
+                )
+                ers["soil"] = soil_error
+                ers["soil_value"] = soil_error
+                logger.warning("SoilGrids data unavailable: %s", soil_error)
         except requests.exceptions.RequestException as e:
-            print(f"An error occurred in soil: {e}")
-            ers["soil"] = f"An error occurred in soil: {e}"
+            value["soil_value"] = []
+            soil_error = f"An error occurred in soil: {e}"
+            ers["soil"] = soil_error
+            ers["soil_value"] = soil_error
+            logger.warning("SoilGrids request failed: %s", e)
         except (KeyError, IndexError):
-            print("Could not parse soil data from the response.") 
-            ers["soil"] = "Could not parse soil data from the response. (KeyError, IndexError)"
+            value["soil_value"] = []
+            soil_error = "Could not parse soil data from the response. (KeyError, IndexError)"
+            ers["soil"] = soil_error
+            ers["soil_value"] = soil_error
+            logger.warning("Could not parse SoilGrids response")
 
         #flood
         try:
             flood = flood_risk(lon_str=str(self.longitude), lat_str= str(self.latitude))
-            value["flood"] = flood
-            ers["flood"] = "ok!"
+            flood_is_valid = (
+                isinstance(flood, dict)
+                and "error" not in flood
+                and isinstance(flood.get("coordinate"), dict)
+                and isinstance(flood.get("flood_risk"), dict)
+                and isinstance(flood.get("forecast"), dict)
+                and isinstance(flood.get("statistics"), dict)
+            )
+            if flood_is_valid:
+                value["flood"] = flood
+                ers["flood"] = "ok!"
+            else:
+                value["flood"] = None
+                flood_error = (
+                    str(flood["error"])
+                    if isinstance(flood, dict) and "error" in flood
+                    else "Flood service returned no valid flood data"
+                )
+                ers["flood"] = flood_error
+                logger.warning("Flood risk data unavailable: %s", flood_error)
         except requests.exceptions.RequestException as e:
-            print(f"An error occurred in flood: {e}")
+            value["flood"] = None
             ers["flood"] = f"An error occurred in flood: {e}"
+            logger.warning("Flood risk request failed: %s", e)
         except (KeyError, IndexError):
-            print("Could not parse flood data from the response.") 
+            value["flood"] = None
             ers["flood"] = "Could not parse flood data from the response. (KeyError, IndexError)"
+            logger.warning("Could not parse flood risk response")
 
         #climate
         try:
@@ -815,14 +877,27 @@ class get_all_infos:
         #proximity
         try:
             proximi = proximity_analysis(self.latitude, self.longitude, radius=5000)
-            value["proximity"] = proximi
-            ers["proximity"] = "ok!"
-        except requests.exceptions.RequestException as e:
-            print(f"An error occurred in proximity: {e}")
+            proximity_results = proximi.get("results") if isinstance(proximi, dict) else None
+            proximity_is_valid = (
+                isinstance(proximi, dict)
+                and isinstance(proximi.get("query"), dict)
+                and isinstance(proximity_results, dict)
+                and all(
+                    isinstance(proximity_results.get(category), list)
+                    for category in ("hospital", "market", "transport")
+                )
+            )
+            if proximity_is_valid:
+                value["proximity"] = proximi
+                ers["proximity"] = "ok!"
+            else:
+                value["proximity"] = None
+                ers["proximity"] = "Overpass returned no valid proximity data"
+                logger.warning("Overpass returned an invalid proximity response")
+        except (RuntimeError, requests.exceptions.RequestException) as e:
+            value["proximity"] = None
             ers["proximity"] = f"An error occurred in proximity: {e}"
-        except (KeyError, IndexError):
-            print("Could not parse proximity data from the response.") 
-            ers["proximity"] = "Could not parse proximity data from the response. (KeyError, IndexError)"
+            logger.warning("Overpass proximity query failed: %s", e)
         
         return [
             self.uuid_parcel,
@@ -840,5 +915,3 @@ class get_all_infos:
 #BIG TEST
 #test = get_all_infos(49.4023, -18.1492, "uuid_test")
 #print(test.all_data())
-            
-       
