@@ -1097,25 +1097,112 @@ def export_kml(current_user):
 
 import requests
 import math
+import requests_cache
+import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 
 EXTERNAL_API_TIMEOUT = (5, 10)  # connect timeout, read timeout (seconds)
+EXTERNAL_API_CACHE_TTLS = {
+    "OpenTopoData elevation": 30 * 24 * 60 * 60,
+    "OpenTopoData slope": 30 * 24 * 60 * 60,
+    "SoilGrids": 30 * 24 * 60 * 60,
+    "flood-tany": 15 * 60,
+    "tany-climate season": 24 * 60 * 60,
+    "tany-climate proximity": 6 * 60 * 60,
+}
+EXTERNAL_API_RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
+EXTERNAL_API_RETRY_DELAY = 0.25
+EXTERNAL_API_MAX_RETRY_DELAY = 0.5
 
 
-def _get_external_json(url, service, params=None):
-    """Fetch and decode one external JSON response with bounded wait time."""
+def _is_cacheable_external_response(response):
+    """Cache only successful HTTP responses containing valid JSON."""
+    if not 200 <= response.status_code < 300:
+        return False
     try:
-        response = requests.get(url, params=params, timeout=EXTERNAL_API_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
-    except requests.Timeout as error:
-        app.logger.warning("%s request timed out: %s", service, error)
-    except requests.ConnectionError as error:
-        app.logger.warning("%s connection failed: %s", service, error)
-    except ValueError as error:
-        app.logger.warning("%s returned invalid JSON: %s", service, error)
-    except requests.RequestException as error:
-        app.logger.warning("%s request failed: %s", service, error)
-    return None
+        response.json()
+    except ValueError:
+        return False
+    return True
+
+
+_external_api_session = requests_cache.CachedSession(
+    cache_name=".external_api_cache",
+    allowable_methods=("GET",),
+    allowable_codes=tuple(range(200, 300)),
+    filter_fn=_is_cacheable_external_response,
+)
+
+
+def _retry_delay(response=None):
+    """Return the bounded retry delay, honoring a short Retry-After for 429."""
+    if response is not None and response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                except (TypeError, ValueError, OverflowError):
+                    delay = None
+
+            if delay is not None and 0 <= delay <= EXTERNAL_API_MAX_RETRY_DELAY:
+                return delay
+
+    return EXTERNAL_API_RETRY_DELAY
+
+
+def _consume_external_retry(retry_budget, service, response=None):
+    if not isinstance(retry_budget, dict) or retry_budget.get("remaining", 0) <= 0:
+        return False
+
+    retry_budget["remaining"] -= 1
+    delay = _retry_delay(response)
+    app.logger.info("Retrying %s once after %.3f seconds", service, delay)
+    if delay:
+        time.sleep(delay)
+    return True
+
+
+def _get_external_json(url, service, params=None, ttl=None, retry_budget=None):
+    """Fetch and decode external JSON with shared cache and retry controls."""
+    while True:
+        try:
+            response = _external_api_session.get(
+                url,
+                params=params,
+                timeout=EXTERNAL_API_TIMEOUT,
+                expire_after=ttl,
+            )
+            response.raise_for_status()
+            try:
+                return response.json()
+            except ValueError as error:
+                app.logger.warning("%s returned invalid JSON: %s", service, error)
+                return None
+        except (requests.Timeout, requests.ConnectionError) as error:
+            if _consume_external_retry(retry_budget, service):
+                continue
+            app.logger.warning("%s request failed: %s", service, error)
+            return None
+        except requests.HTTPError as error:
+            response = error.response
+            status_code = response.status_code if response is not None else None
+            if (
+                status_code in EXTERNAL_API_RETRYABLE_STATUSES
+                and _consume_external_retry(retry_budget, service, response)
+            ):
+                continue
+            app.logger.warning("%s returned HTTP status %s", service, status_code)
+            return None
+        except requests.RequestException as error:
+            app.logger.warning("%s request failed: %s", service, error)
+            return None
 
 
 def _is_finite_number(value):
@@ -1126,7 +1213,7 @@ def _is_finite_number(value):
     )
 
 
-def get_terrain_slope(lat, lon, distance=30):
+def get_terrain_slope(lat, lon, distance=30, retry_budget=None):
     # 1. Calculate the 8 surrounding points
     # 1 degree of lat approx 111,320 meters
     earth_radius = 6378137
@@ -1148,7 +1235,12 @@ def get_terrain_slope(lat, lon, distance=30):
     locations_str = "|".join([f"{p[0]},{p[1]}" for p in points])
     url = f"https://api.opentopodata.org/v1/srtm90m?locations={locations_str}"
 
-    response = _get_external_json(url, "OpenTopoData slope")
+    response = _get_external_json(
+        url,
+        "OpenTopoData slope",
+        ttl=EXTERNAL_API_CACHE_TTLS["OpenTopoData slope"],
+        retry_budget=retry_budget,
+    )
     results = response.get('results') if isinstance(response, dict) else None
     if not isinstance(results, list) or len(results) != len(points):
         app.logger.warning("OpenTopoData slope returned an incomplete result set")
@@ -1180,7 +1272,7 @@ def get_terrain_slope(lat, lon, distance=30):
         "individual_slopes": slopes
     }
 
-def get_soil_data(longitude, latitude):
+def get_soil_data(longitude, latitude, retry_budget=None):
     """
     Fetches soil data from the ISRIC SoilGrids API and returns a flattened
     dictionary of {property_depth : mean_value}.
@@ -1196,7 +1288,13 @@ def get_soil_data(longitude, latitude):
         'value': 'mean'
     }
 
-    data = _get_external_json(url, "SoilGrids", params=params)
+    data = _get_external_json(
+        url,
+        "SoilGrids",
+        params=params,
+        ttl=EXTERNAL_API_CACHE_TTLS["SoilGrids"],
+        retry_budget=retry_budget,
+    )
     if not isinstance(data, dict):
         return None
 
@@ -1216,6 +1314,7 @@ def get_soil_data(longitude, latitude):
 def get_info(xy):
     latitude = xy["latitude"]
     longitude = xy["longitude"]
+    retry_budget = {"remaining": 1}
     value = {
         "elevation": None,
         "max_slope": None,
@@ -1239,7 +1338,12 @@ def get_info(xy):
 
     # Elevation
     open_topo_api = "https://api.opentopodata.org/v1/srtm90m?locations={},{}&interpolation=cubic&format=json".format(latitude, longitude)
-    data = _get_external_json(open_topo_api, "OpenTopoData elevation")
+    data = _get_external_json(
+        open_topo_api,
+        "OpenTopoData elevation",
+        ttl=EXTERNAL_API_CACHE_TTLS["OpenTopoData elevation"],
+        retry_budget=retry_budget,
+    )
     results = data.get("results") if isinstance(data, dict) else None
     if isinstance(results, list) and results and isinstance(results[0], dict):
         elevation = results[0].get("elevation")
@@ -1251,12 +1355,12 @@ def get_info(xy):
         app.logger.warning("OpenTopoData elevation returned an incomplete response")
 
     # Slopes
-    slopes = get_terrain_slope(latitude, longitude, 30)
+    slopes = get_terrain_slope(latitude, longitude, 30, retry_budget=retry_budget)
     if isinstance(slopes, dict):
         value.update(slopes)
 
     # Soil properties
-    soil = get_soil_data(longitude, latitude)
+    soil = get_soil_data(longitude, latitude, retry_budget=retry_budget)
     if isinstance(soil, list):
         value["soil_value"] = soil
 
@@ -1265,6 +1369,8 @@ def get_info(xy):
         "https://flood-tany.onrender.com/flood-risk",
         "flood-tany",
         params={"lat": latitude, "lon": longitude},
+        ttl=EXTERNAL_API_CACHE_TTLS["flood-tany"],
+        retry_budget=retry_budget,
     )
     flood_coordinate = flood.get("coordinate") if isinstance(flood, dict) else None
     if (
@@ -1285,6 +1391,8 @@ def get_info(xy):
         "https://tany-climate.onrender.com/api/season",
         "tany-climate season",
         params={"longitude": longitude, "latitude": latitude},
+        ttl=EXTERNAL_API_CACHE_TTLS["tany-climate season"],
+        retry_budget=retry_budget,
     )
     if isinstance(climates, dict) and not climates.get("error"):
         value["climates"] = climates
@@ -1296,6 +1404,8 @@ def get_info(xy):
         "https://tany-climate.onrender.com/api/proximity",
         "tany-climate proximity",
         params={"longitude": longitude, "latitude": latitude},
+        ttl=EXTERNAL_API_CACHE_TTLS["tany-climate proximity"],
+        retry_budget=retry_budget,
     )
     proximity_results = proximity.get("results") if isinstance(proximity, dict) else None
     if (

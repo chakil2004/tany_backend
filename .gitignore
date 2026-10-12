@@ -19,3 +19,7 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+.external_api_cache.sqlite
+.external_api_cache.sqlite-shm
+.external_api_cache.sqlite-wal
