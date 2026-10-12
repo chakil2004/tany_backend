@@ -196,24 +196,25 @@ def write_messages(current_user):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'message': 'A JSON object is required'}), 400
 
-    # 1. Validation & Extraction
-    fields = ["sender_id", "receiver_id", "content", "uuid_post", "objet"]
+    sender_id = current_user.get('email') if isinstance(current_user, dict) else None
+    if not isinstance(sender_id, str) or not sender_id.strip():
+        return jsonify({'success': False, 'message': 'Authenticated profile has no email'}), 403
 
+    fields = ["receiver_id", "content", "uuid_post", "objet"]
     parcel_d = {}
     for field in fields:
         val = data.get(field)
-        print(val)
-        if val is None or val == "": # Better check than 'if not val' for numbers
-            return jsonify({'success': False, 'message': f'{field} is required'}), 400
+        if not isinstance(val, str) or not val.strip():
+            return jsonify({'success': False, 'message': f'{field} must be a non-empty string'}), 400
         parcel_d[field] = val
+    parcel_d['sender_id'] = sender_id
 
     try:
 
-        # 4. Insert to Supabase
-        # Changed table name to 'parcels' (Assuming 'profiles' was a typo)
-        print(parcel_d)
         response = supabase.table('messages').insert(parcel_d).execute()
 
         return jsonify({
@@ -223,10 +224,10 @@ def write_messages(current_user):
         }), 201
 
     except Exception as e:
-        print(f"Error: {e}") # This helps you debug in the terminal
+        print(f"Message insert error: {e}")
         return jsonify({
             "success": False,
-            "message": str(e) # Returning the error message helps identify the cause
+            "message": "Failed to send message"
         }), 500
 
 @app.route('/api/current_user', methods=['GET'])  # Changed from POST to GET (more appropriate for getting data)
@@ -469,39 +470,67 @@ def verify_token(current_user):
 @app.route('/api/load_message', methods=['GET', 'POST'])
 @token_required
 def get_messages(current_user):
-    data = request.get_json()
-    print(data)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'message': 'A JSON object is required'}), 400
+
     received_value = data.get('data')
+    if not isinstance(received_value, str) or not received_value.strip():
+        return jsonify({'success': False, 'message': 'A conversation subject is required'}), 400
+
+    current_email = current_user.get('email') if isinstance(current_user, dict) else None
+    if not isinstance(current_email, str) or not current_email.strip():
+        return jsonify({'success': False, 'message': 'Authenticated profile has no email'}), 403
+
     try:
         result = supabase.table('messages').select('*').eq("objet", received_value).execute()
+        messages = result.data or []
+        if not messages:
+            return jsonify({'success': False, 'message': 'Conversation not found'}), 404
+
+        participant_messages = [
+            message for message in messages
+            if message.get('sender_id') == current_email or message.get('receiver_id') == current_email
+        ]
+        if not participant_messages:
+            return jsonify({'success': False, 'message': 'You are not a participant in this conversation'}), 403
+
         return jsonify({
             'success': True,
-            'data': result.data
+            'data': participant_messages
         }), 200
     except Exception as e:
-        print(f"Map data error: {str(e)}")
+        print(f"Message fetch error: {e}")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch messages: {str(e)}'
+            'message': 'Failed to fetch messages'
         }), 500
 
 @app.route('/api/load_object', methods=['GET', 'POST'])
 @token_required
 def get_objects(current_user):
-    data = request.get_json()
-    print(data)
-    received_value = data.get('data')
+    if request.method == 'POST':
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'success': False, 'message': 'A JSON object is required'}), 400
+        if 'data' in data and (not isinstance(data['data'], str) or not data['data'].strip()):
+            return jsonify({'success': False, 'message': 'data must be a non-empty string'}), 400
+
+    current_email = current_user.get('email') if isinstance(current_user, dict) else None
+    if not isinstance(current_email, str) or not current_email.strip():
+        return jsonify({'success': False, 'message': 'Authenticated profile has no email'}), 403
+
     try:
-        result = supabase.table('object_message').select('*').eq("main_user", received_value).execute()
+        result = supabase.table('object_message').select('*').eq("main_user", current_email).execute()
         return jsonify({
             'success': True,
             'data': result.data
         }), 200
     except Exception as e:
-        print(f"Map data error: {str(e)}")
+        print(f"Conversation list fetch error: {e}")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch messages: {str(e)}'
+            'message': 'Failed to fetch conversations'
         }), 500
 
 # Example: Get user's map data (protected route)
