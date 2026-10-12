@@ -1,0 +1,21 @@
+# Environment variables / secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+
+# Local caches
+.openmeteo_cache.sqlite
+*.sqlite-journal
+
+# IDE
+.vscode/
+.idea/

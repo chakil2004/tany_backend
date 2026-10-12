@@ -1,0 +1,1247 @@
+from flask import Flask, request, jsonify, Response, stream_with_context
+from flask_cors import CORS
+import jwt
+from functools import wraps
+import os
+from dotenv import load_dotenv
+from supabase import create_client, Client
+import json
+from flask_cors import cross_origin
+from flask import make_response
+import xml.etree.ElementTree as ET
+from datetime import datetime
+import tempfile
+from shapely.geometry import shape
+from shapely.ops import transform
+import geojson
+
+load_dotenv()
+
+app = Flask(__name__)
+#CORS(app)  # Enable CORS for frontend requests
+CORS(app, origins=["http://127.0.0.1:5500", "http://127.0.0.1:5501", "http://localhost:5500", "http://localhost:5501", "https://tany-main-v1-b0gt2r9v5-michel-raherimanantsoas-projects.vercel.app", "https://tany-main-v1.vercel.app", "https://tany-main-v1-o52dpd7ax-michel-raherimanantsoas-projects.vercel.app", "https://tany-main-v1-jp8zipbm9-michel-raherimanantsoas-projects.vercel.app","https://michelheriman.github.io/tany_main_v1/", "https://michelheriman.github.io", "https://tany-main-v1-git-main-michel-raherimanantsoas-projects.vercel.app", "https://tanylandrustv2.vercel.app"], supports_credentials=True)
+# OR for more specific control:
+#CORS(app, resources={r"/api/*": {"origins": "http://127.0.0.1:5500"}})
+
+###fafana rehefa uploaded###
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        res = make_response()
+        res.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+        res.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        res.headers['Access-Control-Max-Age'] = '3600'
+        res.status_code = 200
+        return res
+############################
+
+basedir = os.path.abspath(os.path.dirname(__file__))
+# Join it with the .env filename
+load_dotenv(os.path.join(basedir, '.env'))
+
+# Configuration from .env
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+JWT_SECRET = os.getenv('SECRET_KEY')
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Decorator to require authentication
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # --- FIX STARTS HERE ---
+        if request.method == 'OPTIONS':
+            return f(None, *args, **kwargs) # Pass None as current_user for OPTIONS
+        # --- FIX ENDS HERE ---
+        auth_header = request.headers.get('Authorization')
+
+        if not auth_header:
+            return jsonify({'success': False, 'message': 'Authorization header is missing'}), 401
+
+        # Ensure it follows the "Bearer <token>" format
+        parts = auth_header.split()
+        if parts[0].lower() != 'bearer' or len(parts) != 2:
+            return jsonify({'success': False, 'message': 'Authorization header must be "Bearer <token>"'}), 401
+
+        token = parts[1]
+
+        try:
+            # IMPORTANT: For Supabase JWT tokens, we need to verify using the JWT secret
+            # Supabase uses JWKS (JSON Web Key Set) for verification
+            # Let's decode without verification first to see the token structure
+            unverified_token = jwt.decode(token, options={"verify_signature": False})
+            '''
+            unverified_token = jwt.decode(
+                                            token,
+                                            JWT_SECRET,
+                                            algorithms=["HS256"],
+                                            options={"verify_signature": True}  # True by default, explicitly set here for clarity
+                                        )
+                                        '''
+            print(f"Token payload: {json.dumps(unverified_token, indent=2)}")
+
+            # For Supabase tokens, we need to get the public key from Supabase
+            # Supabase tokens are signed with RS256 or ES256, not HS256
+
+            # For now, let's use a simpler approach - verify the user through Supabase
+            # Get user from the token using Supabase auth
+
+            # Try to get the user from Supabase using the token
+            supabase_auth_response = supabase.auth.get_user(token)
+
+            if not supabase_auth_response.user:
+                return jsonify({'success': False, 'message': 'Invalid token or user not found'}), 401
+
+            # Get user profile from profiles table
+            profile_query = supabase.table('profiles').select('*').eq('uuid', supabase_auth_response.user.id).execute()
+
+            if not profile_query.data:
+                return jsonify({'success': False, 'message': 'User profile not found'}), 401
+
+            current_user = profile_query.data[0]
+
+        except jwt.ExpiredSignatureError:
+            return jsonify({'success': False, 'message': 'Token has expired'}), 401
+        except jwt.InvalidTokenError as e:
+            return jsonify({'success': False, 'message': f'Invalid token: {str(e)}'}), 401
+        except Exception as e:
+            print(f"Auth error: {str(e)}")
+            return jsonify({'success': False, 'message': f'Authentication error: {str(e)}'}), 401
+
+        return f(current_user, *args, **kwargs)
+
+    return decorated
+
+@app.route('/check-username', methods=['POST'])
+def check_username():
+    data = request.json
+    username = data.get('username', '').strip()
+
+    if not username:
+        return jsonify({"available": False, "message": "Username is empty"}), 400
+
+    try:
+        response = supabase.table("profiles") \
+            .select("username", count="exact") \
+            .eq("username", username) \
+            .execute()
+
+        is_available = response.count == 0
+
+        return jsonify({
+            "available": is_available,
+            "username": username
+        }), 200
+
+    except Exception as e:
+        print(f"Database error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/parcels_w', methods=['POST', 'OPTIONS'])
+@token_required
+def draw_parcels(current_user):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+
+    data = request.get_json()
+
+    # 1. Validation & Extraction
+    fields = ["owner", "price_m2", "price", "currency", "location_name",
+              "description", "owner_uuid", "sell_category","status_category", "longitude",
+              "latitude", "parcel_name", "geojson", "area_ha"]
+
+    parcel_d = {}
+    for field in fields:
+        val = data.get(field)
+        #if val is None or val == "": # Better check than 'if not val' for numbers
+        if val is None or (isinstance(val, str) and val.strip() == ""):
+            return jsonify({'success': False, 'message': f'{field} is required'}), 400
+        parcel_d[field] = val
+
+    try:
+        # 2. Critical Fix: Convert geojson string to a Python Dict (JSONB in Postgres)
+        if isinstance(parcel_d['geojson'], str):
+            parcel_d['geojson'] = json.loads(parcel_d['geojson'])
+
+        # 3. Type Casting (Ensure numbers aren't strings)
+        parcel_d['price'] = float(parcel_d['price'])
+        parcel_d['price_m2'] = float(parcel_d['price_m2'])
+        parcel_d['area_ha'] = float(parcel_d['area_ha'])
+
+        # 4. Insert to Supabase
+        # Changed table name to 'parcels' (Assuming 'profiles' was a typo)
+        print(parcel_d)
+        response = supabase.table('main_parcels').insert(parcel_d).execute()
+
+        return jsonify({
+            "success": True,
+            "message": "Parcel registered successfully",
+            "data": response.data
+        }), 201
+
+    except Exception as e:
+        print(f"Error: {e}") # This helps you debug in the terminal
+        return jsonify({
+            "success": False,
+            "message": str(e) # Returning the error message helps identify the cause
+        }), 500
+
+@app.route('/api/messages_w', methods=['POST', 'OPTIONS'])
+@token_required
+def write_messages(current_user):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+
+    data = request.get_json()
+
+    # 1. Validation & Extraction
+    fields = ["sender_id", "receiver_id", "content", "uuid_post", "objet"]
+
+    parcel_d = {}
+    for field in fields:
+        val = data.get(field)
+        print(val)
+        if val is None or val == "": # Better check than 'if not val' for numbers
+            return jsonify({'success': False, 'message': f'{field} is required'}), 400
+        parcel_d[field] = val
+
+    try:
+
+        # 4. Insert to Supabase
+        # Changed table name to 'parcels' (Assuming 'profiles' was a typo)
+        print(parcel_d)
+        response = supabase.table('messages').insert(parcel_d).execute()
+
+        return jsonify({
+            "success": True,
+            "message": "message sent",
+            "data": response.data
+        }), 201
+
+    except Exception as e:
+        print(f"Error: {e}") # This helps you debug in the terminal
+        return jsonify({
+            "success": False,
+            "message": str(e) # Returning the error message helps identify the cause
+        }), 500
+
+@app.route('/api/current_user', methods=['GET'])  # Changed from POST to GET (more appropriate for getting data)
+@token_required
+def get_current_user_email(current_user):
+    """Get current user email from JWT token"""
+    try:
+        # Since you're using @token_required, current_user is already passed
+        # This contains the user data from your database
+        email = current_user.get('email')
+
+        if not email:
+            # Try to extract from token as fallback
+            auth_header = request.headers.get('Authorization')
+            if auth_header:
+                parts = auth_header.split()
+                if parts[0].lower() == 'bearer' and len(parts) == 2:
+                    token = parts[1]
+                    unverified_data = jwt.decode(token, options={"verify_signature": False})
+                    '''
+                    unverified_data = jwt.decode(
+                                    token,
+                                    JWT_SECRET,
+                                    algorithms=["HS256"],
+                                    options={"verify_signature": True}  # True by default, explicitly set here for clarity
+                                ) '''
+
+                    email = (
+                        unverified_data.get('email') or
+                        unverified_data.get('user_email') or
+                        unverified_data.get('user_metadata', {}).get('email') or
+                        unverified_data.get('sub')
+                    )
+
+        if email:
+            return jsonify({
+                'success': True,
+                'message': 'User email retrieved successfully',
+                'data': {
+                    'email': email,
+                    'user_id': current_user.get('uuid') or current_user.get('id'),
+                    'name': current_user.get('name'),
+                    'username': current_user.get('username')
+                }
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Email not found in user data or token',
+                'data': None
+            }), 404
+
+    except Exception as e:
+        print(f"Error getting user email: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Error retrieving user information: {str(e)}',
+            'data': None
+        }), 500
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    """Register a new user using Supabase Auth"""
+    data = request.get_json()
+
+    # Validate required fields
+    #required_fields = ['email', 'password', 'name', 'username', 'mobile', 'address', 'idCard', 'account']
+    required_fields = ['email', 'password', 'name', 'username', 'mobile',  'account']
+    for field in required_fields:
+        if not data or not data.get(field):
+            return jsonify({
+                'success': False,
+                'message': f'{field.capitalize()} is required'
+            }), 400
+
+    email = data['email']
+    password = data['password']
+    name = data['name']
+    username = data['username']
+    mobile = data['mobile']
+    #address = data['address']
+    #id_card = data['idCard']
+    account_type = data['account']
+
+    try:
+        # Check if username already exists in profiles table
+        existing_username = supabase.table('profiles').select('username').eq('username', username).execute()
+
+        if existing_username.data and len(existing_username.data) > 0:
+            return jsonify({
+                'success': False,
+                'message': 'Username already exists'
+            }), 409
+
+        # Check if email already exists
+        existing_email = supabase.table('profiles').select('email').eq('email', email).execute()
+
+        if existing_email.data and len(existing_email.data) > 0:
+            return jsonify({
+                'success': False,
+                'message': 'Email already exists'
+            }), 409
+
+        # Sign up user with Supabase Auth
+        auth_response = supabase.auth.sign_up({
+            'email': email,
+            'password': password,
+            'options': {
+                'data': {
+                    'name': name,
+                    'username': username
+                }
+            }
+        })
+
+        if auth_response.user:
+            # Store additional user profile data in profiles table
+            profile_data = {
+                'uuid': auth_response.user.id,
+                'name': name,
+                'username': username,
+                'mobile': mobile,
+                #'address': address,
+                #'id_card': id_card,
+                'account': account_type,
+                'email': email
+            }
+
+            supabase.table('profiles').insert(profile_data).execute()
+
+            return jsonify({
+                'success': True,
+                'message': 'User registered successfully',
+                'user': {
+                    'id': auth_response.user.id,
+                    'email': auth_response.user.email,
+                    'name': name,
+                    'username': username
+                }
+            }), 201
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Registration failed'
+            }), 400
+
+    except Exception as e:
+        error_message = str(e)
+        if 'already registered' in error_message.lower() or 'user already exists' in error_message.lower():
+            return jsonify({
+                'success': False,
+                'message': 'Email already exists'
+            }), 409
+        print(f"Registration error: {error_message}")
+        return jsonify({
+            'success': False,
+            'message': f'Registration failed: {error_message}'
+        }), 500
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    """Authenticate user using Supabase Auth"""
+    data = request.get_json()
+
+    # Validate input
+    if not data or not data.get('email') or not data.get('password'):
+        return jsonify({
+            'success': False,
+            'message': 'Email and password are required'
+        }), 400
+
+    email = data['email']
+    password = data['password']
+
+    try:
+        # Sign in with Supabase Auth
+        auth_response = supabase.auth.sign_in_with_password({
+            'email': email,
+            'password': password
+        })
+
+        if auth_response.user and auth_response.session:
+            return jsonify({
+                'success': True,
+                'message': 'Login successful',
+                'token': auth_response.session.access_token,
+                'refresh_token': auth_response.session.refresh_token,
+                'user': {
+                    'id': auth_response.user.id,
+                    'email': auth_response.user.email,
+                    'name': auth_response.user.user_metadata.get('name', '')
+                }
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid credentials'
+            }), 401
+
+    except Exception as e:
+        error_message = str(e)
+        if 'Invalid login credentials' in error_message or 'invalid' in error_message.lower():
+            return jsonify({
+                'success': False,
+                'message': 'Invalid email or password'
+            }), 401
+        print(f"Login error: {error_message}")
+        return jsonify({
+            'success': False,
+            'message': f'Login failed: {error_message}'
+        }), 500
+
+@app.route('/api/protected', methods=['GET'])
+@token_required
+def protected_route(current_user):
+    """Example of a protected route that requires authentication"""
+    return jsonify({
+        'success': True,
+        'message': 'This is protected data',
+        'user': {
+            'id': current_user['uuid'],
+            'email': current_user['email'],
+            'name': current_user.get('name', '')
+        }
+    }), 200
+
+@app.route('/api/verify', methods=['GET'])
+@token_required
+def verify_token(current_user):
+    """Verify if token is valid"""
+    return jsonify({
+        'success': True,
+        'message': 'Token is valid',
+        'user': {
+            'id': current_user['uuid'],
+            'email': current_user['email'],
+            'name': current_user.get('name', '')
+        }
+    }), 200
+
+@app.route('/api/load_message', methods=['GET', 'POST'])
+@token_required
+def get_messages(current_user):
+    data = request.get_json()
+    print(data)
+    received_value = data.get('data')
+    try:
+        result = supabase.table('messages').select('*').eq("objet", received_value).execute()
+        return jsonify({
+            'success': True,
+            'data': result.data
+        }), 200
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch messages: {str(e)}'
+        }), 500
+
+@app.route('/api/load_object', methods=['GET', 'POST'])
+@token_required
+def get_objects(current_user):
+    data = request.get_json()
+    print(data)
+    received_value = data.get('data')
+    try:
+        result = supabase.table('object_message').select('*').eq("main_user", received_value).execute()
+        return jsonify({
+            'success': True,
+            'data': result.data
+        }), 200
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch messages: {str(e)}'
+        }), 500
+
+# Example: Get user's map data (protected route)
+@app.route('/api/getprodd', methods=['GET', 'POST'])
+def get_product():
+    """Get map data for authenticated user"""
+    data = request.get_json()
+    print(data)
+    received_value = data.get('data')
+    print(received_value)
+    try:
+        # Example: fetch locations from Supabase that belong to the user
+        result = supabase.table('main_parcels').select('*').eq('uuid', received_value).execute() #changer pour la table profile
+        #result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+
+
+        return jsonify({
+            'success': True,
+            'data': result.data
+        }), 200
+
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch map data: {str(e)}'
+        }), 500
+
+# Example: Get user's map data (protected route)
+@app.route('/api/market', methods=['GET', 'POST'])
+@token_required
+def get_market(current_user):
+    """Get map data for authenticated user"""
+    try:
+        # Example: fetch locations from Supabase that belong to the user
+        result = supabase.table('main_parcels').select('*').eq('sell_category', 'to_sell').execute() #changer pour la table profile
+        #result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+
+
+        return jsonify({
+            'success': True,
+            'data': result.data
+        }), 200
+
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch map data: {str(e)}'
+        }), 500
+
+@app.route('/api/update_t', methods=['GET', 'POST'])
+@token_required
+def update_map_data(current_user):
+    """Get map data for authenticated user"""
+    data = request.get_json()
+    print(data)
+    received_value = data.get('element')
+    rowid = data.get('id')
+    try:
+        # Example: fetch locations from Supabase that belong to the user
+        result = supabase.table('main_parcels').update(received_value).eq('id', rowid).eq('owner_uuid', current_user['email']).execute() #changer pour la table profile
+        #result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+
+
+        return jsonify({
+            'success': True,
+            'data': result.data
+        }), 200
+
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch map data: {str(e)}'
+        }), 500
+# Example: Get user's map data (protected route)
+
+@app.route('/api/map-data', methods=['GET'])
+@token_required
+def get_map_data(current_user):
+    """Get map data for authenticated user"""
+    try:
+        # Example: fetch locations from Supabase that belong to the user
+        result = supabase.table('main_parcels').select('*').eq('owner_uuid', current_user['email']).execute() #changer pour la table profile
+        #result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+
+
+        return jsonify({
+            'success': True,
+            'data': result.data
+        }), 200
+
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch map data: {str(e)}'
+        }), 500
+
+# Example: Get user's map data (protected route)
+@app.route('/api/account', methods=['GET', 'POST'])
+@token_required
+def get_map_account(current_user):
+    """Get map data for authenticated user"""
+    try:
+        # Example: fetch locations from Supabase that belong to the user
+        #result = supabase.table('main_parcels').select('*').eq('owner_uuid', current_user['email']).execute() #changer pour la table profile
+        result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+        print(result.data)
+
+        return jsonify({
+            'success': True,
+            'data': result.data
+        }), 200
+
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch map data: {str(e)}'
+        }), 500
+
+@app.route('/api/logout', methods=['POST'])
+@token_required
+def logout(current_user):
+    """Logout user"""
+    try:
+        # Supabase handles logout on the client side
+        # You can invalidate the token on your backend if needed
+        return jsonify({
+            'success': True,
+            'message': 'Logout successful'
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Logout failed: {str(e)}'
+        }), 500
+
+@app.route('/api/refresh-token', methods=['POST'])
+def refresh_token():
+    """Refresh access token using refresh token"""
+    data = request.get_json(silent=True)
+    refresh_token = data.get('refresh_token') if isinstance(data, dict) else None
+
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        return jsonify({'success': False, 'message': 'Refresh token is missing or invalid'}), 401
+
+    try:
+        # Use Supabase to refresh the token
+        auth_response = supabase.auth.refresh_session(refresh_token)
+        session = getattr(auth_response, 'session', None)
+        access_token = getattr(session, 'access_token', None)
+        rotated_refresh_token = getattr(session, 'refresh_token', None)
+
+        if access_token and rotated_refresh_token:
+            return jsonify({
+                'success': True,
+                'message': 'Token refreshed',
+                'token': access_token,
+                'refresh_token': rotated_refresh_token
+            }), 200
+        return jsonify({'success': False, 'message': 'Refresh token is no longer valid'}), 401
+    except Exception as error:
+        provider_status = getattr(error, 'status', None)
+        provider_error_name = getattr(error, 'name', error.__class__.__name__)
+        if provider_status in (400, 401, 403) or provider_error_name == 'AuthSessionMissingError':
+            return jsonify({'success': False, 'message': 'Refresh token is no longer valid'}), 401
+        app.logger.warning('The authentication provider could not refresh the session.')
+        return jsonify({'success': False, 'message': 'The authentication service is temporarily unavailable'}), 503
+
+# Configure upload settings
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_EXTENSIONS = {'kml'}
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def coordinates_to_geojson(coords_text, geometry_type):
+    """Convert KML coordinates to GeoJSON format"""
+    if not coords_text:
+        return None
+
+    coords_text = coords_text.strip()
+
+    try:
+        if geometry_type == 'Point':
+            # Point coordinates: "long,lat[,alt]"
+            coords = coords_text.split(',')
+            if len(coords) >= 2:
+                lon, lat = float(coords[0]), float(coords[1])
+                return {
+                    'type': 'Point',
+                    'coordinates': [lon, lat]
+                }
+
+        elif geometry_type == 'LineString':
+            # LineString coordinates: "lon1,lat1[,alt1] lon2,lat2[,alt2] ..."
+            coordinates = []
+            for coord_set in coords_text.split():
+                coords = coord_set.split(',')
+                if len(coords) >= 2:
+                    lon, lat = float(coords[0]), float(coords[1])
+                    coordinates.append([lon, lat])
+            if coordinates:
+                return {
+                    'type': 'LineString',
+                    'coordinates': coordinates
+                }
+
+        elif geometry_type == 'Polygon':
+            # Polygon coordinates: "lon1,lat1[,alt1] lon2,lat2[,alt2] ..."
+            coordinates = []
+            for coord_set in coords_text.split():
+                coords = coord_set.split(',')
+                if len(coords) >= 2:
+                    lon, lat = float(coords[0]), float(coords[1])
+                    coordinates.append([lon, lat])
+            if coordinates:
+                # Close the polygon by repeating the first point
+                if coordinates[0] != coordinates[-1]:
+                    coordinates.append(coordinates[0])
+                return {
+                    'type': 'Polygon',
+                    'coordinates': [coordinates]
+                }
+
+    except (ValueError, IndexError) as e:
+        print(f"Error parsing coordinates: {e}")
+        return None
+
+    return None
+
+def parse_kml_file(file_path):
+    """Parse KML file and extract the first polygon geometry (for land parcels)"""
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+
+        # Define namespaces for KML
+        namespaces = {
+            'kml': 'http://www.opengis.net/kml/2.2'
+        }
+
+        # Look for Polygon geometries (most common for land parcels)
+        polygon = root.find('.//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates', namespaces)
+        if polygon is not None and polygon.text:
+            geojson = coordinates_to_geojson(polygon.text.strip(), 'Polygon')
+            if geojson:
+                return geojson
+
+        # If no polygon found, try to find any geometry
+        geometries = [
+            ('.//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates', 'Polygon'),
+            ('.//kml:LineString/kml:coordinates', 'LineString'),
+            ('.//kml:Point/kml:coordinates', 'Point')
+        ]
+
+        for xpath, geom_type in geometries:
+            element = root.find(xpath, namespaces)
+            if element is not None and element.text:
+                geojson = coordinates_to_geojson(element.text.strip(), geom_type)
+                if geojson:
+                    return geojson
+
+        return None
+
+    except ET.ParseError as e:
+        raise ValueError(f"Invalid KML file: {str(e)}")
+    except Exception as e:
+        raise ValueError(f"Error parsing KML file: {str(e)}")
+
+def store_parcel_in_supabase(form_data, geojson_geometry):
+    """Store parcel data with GeoJSON geometry in existing table"""
+    try:
+        # Assuming your table is named 'parcels' - change this to your actual table name
+        table_name = 'main_parcels'
+
+        # Prepare the record data
+        record_data = {
+            'owner': form_data['owner'],
+            'owner_uuid': form_data['owner_uuid'],
+            'parcel_name': form_data['parcel_name'],
+            'location_name': form_data['location_name'],
+            'description': form_data.get('description', ''),
+            'price_m2': form_data.get('price_m2'),
+            'price': form_data.get('price'),
+            'currency' : form_data.get('currency'),
+            'geojson': json.dumps(geojson_geometry),  # Store as JSON string
+            'created_at': datetime.utcnow().isoformat(),
+            #'updated_at': datetime.utcnow().isoformat()
+            'sell_category' : form_data.get('sell_category'),
+            'status_category' : form_data.get('status_category')
+        }
+
+        # Remove None values to avoid database issues
+        record_data = {k: v for k, v in record_data.items() if v is not None}
+
+        # Insert record into the table
+        response = supabase.table(table_name).insert(record_data).execute()
+
+        if hasattr(response, 'data') and response.data:
+            return {
+                'status': 'success',
+                'record_id': response.data[0]['id'],
+                'message': 'Parcel data stored successfully'
+            }
+        else:
+            error_msg = getattr(response, 'error', 'Unknown error occurred')
+            return {
+                'status': 'error',
+                'message': f'Failed to insert data into database: {error_msg}'
+            }
+
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': f'Database error: {str(e)}'
+        }
+
+@app.route('/api/upload-kml', methods=['POST'])
+@token_required
+def upload_kml(current_user):
+    """Handle KML file upload with parcel information"""
+    try:
+        # Check if file is present in request
+        if 'kmlFile' not in request.files:
+            return jsonify({
+                'status': 'error',
+                'message': 'No file provided'
+            }), 400
+
+        file = request.files['kmlFile']
+
+        # Check if file is selected
+        if file.filename == '':
+            return jsonify({
+                'status': 'error',
+                'message': 'No file selected'
+            }), 400
+
+        # Check file extension
+        if not allowed_file(file.filename):
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid file type. Only KML files are allowed.'
+            }), 400
+
+        # Get form data
+        form_data = {
+            'owner': request.form.get('owner', '').strip(),
+            'owner_uuid': request.form.get('owner_uuid', '').strip(),
+            'parcel_name': request.form.get('parcel_name', '').strip(),
+            'location_name': request.form.get('location_name', '').strip(),
+            'description': request.form.get('description', '').strip(),
+            'price_m2': request.form.get('price_m2', type=float),
+            'price': request.form.get('price', type=float),
+            'sell_category' : request.form.get('sell_category', '').strip(),
+            'status_category': request.form.get('status_category', '').strip(),
+            'currency': request.form.get('currency', '').strip()
+
+        }
+
+        # Validate required form fields
+        required_fields = ['owner', 'owner_uuid', 'parcel_name', 'location_name', 'sell_category', 'status_category']
+        for field in required_fields:
+            if not form_data[field]:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'{field.replace("_", " ").title()} is required'
+                }), 400
+
+        # Read file content
+        file_content = file.read()
+
+        # Check file size
+        if len(file_content) > MAX_FILE_SIZE:
+            return jsonify({
+                'status': 'error',
+                'message': f'File size exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit'
+            }), 400
+
+        # Create temporary file for parsing
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as temp_file:
+            temp_file.write(file_content)
+            temp_file_path = temp_file.name
+
+        try:
+            # Parse KML file and extract geometry as GeoJSON
+            geojson_geometry = parse_kml_file(temp_file_path)
+
+            if not geojson_geometry:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'No valid geometry found in KML file'
+                }), 400
+
+            # Store data in Supabase table
+            result = store_parcel_in_supabase(form_data, geojson_geometry)
+
+            if result['status'] == 'success':
+                return jsonify({
+                    'status': 'success',
+                    'message': result['message'],
+                    'data': {
+                        'record_id': result['record_id'],
+                        'parcel_name': form_data['parcel_name'],
+                        'geometry_type': geojson_geometry.get('type', 'Unknown')
+                    }
+                }), 200
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': result['message']
+                }), 500
+
+        except ValueError as e:
+            return jsonify({
+                'status': 'error',
+                'message': str(e)
+            }), 400
+
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Server error: {str(e)}'
+        }), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'message': 'Parcel Upload API is running'})
+
+#export part
+def geojson_to_kml(rows, name_field='name', desc_field='description'):
+    placemarks = []
+    for row in rows:
+        geom_data = row['geojson']  # your actual column name
+
+        # if stored as string, parse it
+        if isinstance(geom_data, str):
+            geom_data = geojson.loads(geom_data)
+
+        geom = shape(geom_data)  # shapely geometry
+        coords = geom_to_kml_coords(geom)
+        name = row.get(name_field, '')
+        desc = row.get(desc_field, '')
+
+        placemarks.append(f"""
+        <Placemark>
+            <name>{name}</name>
+            <description>{desc}</description>
+            {coords}
+        </Placemark>""")
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Export</name>
+    {''.join(placemarks)}
+  </Document>
+</kml>"""
+
+def geom_to_kml_coords(geom):
+    gtype = geom.geom_type
+    if gtype == 'Point':
+        x, y = geom.x, geom.y
+        return f"<Point><coordinates>{x},{y},0</coordinates></Point>"
+    elif gtype == 'LineString':
+        coords = ' '.join(f"{x},{y},0" for x, y in geom.coords)
+        return f"<LineString><coordinates>{coords}</coordinates></LineString>"
+    elif gtype == 'Polygon':
+        outer = ' '.join(f"{x},{y},0" for x, y in geom.exterior.coords)
+        rings = f"<outerBoundaryIs><LinearRing><coordinates>{outer}</coordinates></LinearRing></outerBoundaryIs>"
+        for interior in geom.interiors:
+            inner = ' '.join(f"{x},{y},0" for x, y in interior.coords)
+            rings += f"<innerBoundaryIs><LinearRing><coordinates>{inner}</coordinates></LinearRing></innerBoundaryIs>"
+        return f"<Polygon>{rings}</Polygon>"
+    elif gtype.startswith('Multi') or gtype == 'GeometryCollection':
+        parts = ''.join(geom_to_kml_coords(g) for g in geom.geoms)
+        return f"<MultiGeometry>{parts}</MultiGeometry>"
+    return ''
+
+@app.route('/export/kml', methods=['GET', 'POST'])
+@token_required
+def export_kml(current_user):
+    response = supabase.table('main_parcels').select('*').eq('owner_uuid', current_user['email']).execute()
+    kml = geojson_to_kml(response.data)
+
+    return Response(
+        kml,
+        mimetype='application/vnd.google-earth.kml+xml',
+        headers={'Content-Disposition': 'attachment; filename=export.kml'}
+    )
+
+##new adds ##
+
+import requests
+import math
+
+def get_terrain_slope(lat, lon, distance=30):
+    # 1. Calculate the 8 surrounding points
+    # 1 degree of lat approx 111,320 meters
+    earth_radius = 6378137
+    lat_rad = math.radians(lat)
+
+    # Offsets for 8 directions (0, 45, 90, ..., 315 degrees)
+    points = [(lat, lon)] # Start with center
+    for i in range(8):
+        angle = math.radians(i * 45)
+
+        # Calculate coordinate offsets
+        d_lat = (distance * math.cos(angle)) / 111320
+        d_lon = (distance * math.sin(angle)) / (111320 * math.cos(lat_rad))
+
+        points.append((lat + d_lat, lon + d_lon))
+
+    # 2. Batch request to API
+    # Format: loc1_lat,loc1_lon|loc2_lat,loc2_lon...
+    locations_str = "|".join([f"{p[0]},{p[1]}" for p in points])
+    url = f"https://api.opentopodata.org/v1/srtm90m?locations={locations_str}"
+
+    response = requests.get(url).json()
+    elevations = [r['elevation'] for r in response['results']]
+
+    center_elev = elevations[0]
+    surrounding_elevs = elevations[1:]
+
+    # 3. Calculate slopes
+    # Slope = atan(rise / run) * (180 / pi)
+    slopes = []
+    for elev in surrounding_elevs:
+        rise = elev - center_elev
+        # Formula: degrees = atan(rise/run) * (180/pi)
+        slope_deg = math.degrees(math.atan(abs(rise) / distance))
+        slopes.append(slope_deg)
+
+    return {
+        "max_slope": max(slopes),
+        "avg_slope": sum(slopes) / len(slopes),
+        "individual_slopes": slopes
+    }
+
+def get_soil_data(longitude, latitude):
+    """
+    Fetches soil data from the ISRIC SoilGrids API and returns a flattened
+    dictionary of {property_depth : mean_value}.
+    """
+    soil = []
+    url = "https://rest.isric.org/soilgrids/v2.0/properties/query"
+
+    params = {
+        'lon': longitude,
+        'lat': latitude,
+        'property': ['bdod', 'cec', 'cfvo', 'clay', 'nitrogen', 'phh2o', 'sand', 'silt', 'soc', 'ocd', 'wv0010', 'wv0033', 'wv1500'],
+        'depth': ['0-5cm'],
+        'value': 'mean'
+    }
+
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        data = response.json()
+        for i in data["properties"]["layers"]:
+            #print(i["name"])
+            soil.append({"name" : i["name"],
+                        "unit_measure" : i["unit_measure"]["mapped_units"],
+                        "values" : i["depths"][0]["values"]["mean"]})
+
+
+        return soil
+
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to fetch data: {str(e)}"}
+    except (KeyError, AttributeError) as e:
+        return {"error": f"Failed to parse API response: {str(e)}"}
+
+def get_info(xy):
+    value = {}
+    #elevation
+    open_topo_api = "https://api.opentopodata.org/v1/srtm90m?locations={},{}&interpolation=cubic&format=json".format(xy["latitude"], xy["longitude"])
+    try:
+        # Send the GET request
+        response = requests.get(open_topo_api)
+
+        # Raise an exception if the request was unsuccessful
+        response.raise_for_status()
+
+        # Parse the JSON response
+        data = response.json()
+
+        # Access the elevation value
+        # The structure is typically {'results': [{'elevation': 123.4, ...}], 'status': 'OK'}
+        '''elevation addtiion'''
+        elevation = data['results'][0]['elevation']
+        value["elevation"] = elevation
+
+        '''slopes addition'''
+        slopes = get_terrain_slope(xy["latitude"], xy["longitude"], 30)
+        value.update(slopes)
+        '''
+        {
+        "max_slope": max(slopes),
+        "avg_slope": sum(slopes) / len(slopes),
+        "individual_slopes": slopes
+    }
+        '''
+
+        '''soil type addition'''
+        soil = get_soil_data(xy["longitude"], xy["latitude"])
+        value["soil_value"] = soil
+
+        '''flood api '''
+        flink = "https://flood-tany.onrender.com/flood-risk?lat={}&lon={}".format(xy["latitude"], xy["longitude"])
+        flood_response = requests.get(flink)
+        flood = flood_response.json()
+        value["flood"] = flood
+
+        '''climate api'''
+        clink = "https://tany-climate.onrender.com/api/season?longitude={}&latitude={}".format(xy["latitude"], xy["longitude"])
+        clink_res =  requests.get(clink)
+        climates = clink_res.json()
+        value["climates"] = climates
+
+        '''proximity'''
+        ### try to erase the comment status on 4th june
+
+        proxi = "https://tany-climate.onrender.com/api/proximity?longitude={}&latitude={}".format(xy["latitude"], xy["longitude"])
+        proxi_res = requests.get(proxi)
+        proximi = proxi_res.json()
+        value["proximity"] = proximi
+
+        '''return the data'''
+        return value
+
+    except requests.exceptions.RequestException as e:
+        print(f"An error occurred: {e}")
+    except (KeyError, IndexError):
+        print("Could not parse elevation data from the response.")
+
+
+'''add for statics in pythonanywhere: take data from supabase directly instead of fetching the api'''
+@app.route('/api/get_infos', methods=['GET', 'POST'])
+@token_required
+def great_info(current_user):
+    data = request.get_json()
+    try:
+        uuid_p = data.get("data")
+        result = supabase.table('georeport').select('*').eq("uuid_parcel", uuid_p).execute()
+        account = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+        profile_type = account.data[0]["account"]
+        if profile_type != "free":
+            return jsonify({
+                'success': True,
+                'data': result.data
+            }), 200
+        else:
+            return jsonify({
+            'success': False,
+            'message': f'account free is not allowed'
+            }), 500
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch messages: {str(e)}'
+        }), 500
+
+'''end of the new fetching '''
+
+@app.route('/api/get_infos_', methods=['GET', 'POST', 'OPTIONS'])
+@token_required
+def give_info(current_user):
+    data = request.get_json() #format {"longitude": xx.xx , "latitude" : xx.xx}
+    account = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+    profile_data = account.data[0]
+    profile_type = profile_data.get("account")
+    try:
+        results = get_info(data.get("data"))
+        print(results)
+        if profile_type != "free":
+            return jsonify({
+                    'success': True,
+                    'data': results,
+                    'balise' : data.get("data")
+                }), 200
+        else:
+            return jsonify({
+                'success' : False,
+                'message' : 'Upgrade your account'
+            }), 500
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch map data: {str(e)}'
+        }), 500
+
+
+###news###
+@app.route('/api/getcoords', methods=['GET', 'POST', 'OPTIONS'])
+@token_required
+def get_coords(current_user):
+    """Get map data for authenticated user"""
+    data = request.get_json()
+    received_value = data.get('data')
+    try:
+        # Example: fetch locations from Supabase that belong to the user
+        result = supabase.table('main_parcels').select('*').eq('uuid', received_value).execute() #changer pour la table profile
+        ##new adds##
+        account = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+        profile_data = account.data[0]
+        profile_type = profile_data.get("account")
+        if profile_type != "free":
+
+            return jsonify({
+                'success': True,
+                'data': result.data
+            }), 200
+
+        else:
+            return jsonify({
+                'success' : True,
+                'data': result.data,
+                'message' : 'Upgrade your account'
+            }), 200
+
+    except Exception as e:
+        print(f"Map data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to fetch map data: {str(e)}'
+        }), 500
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
