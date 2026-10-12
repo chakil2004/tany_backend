@@ -23,10 +23,21 @@ CORS(app, origins=["http://127.0.0.1:5500", "http://127.0.0.1:5501", "http://loc
 # OR for more specific control:
 #CORS(app, resources={r"/api/*": {"origins": "http://127.0.0.1:5500"}})
 
+def _deprecated_getcoords_response():
+    response = make_response(jsonify({
+        'success': False,
+        'message': 'This endpoint is deprecated'
+    }), 410)
+    response.headers['Deprecation'] = 'true'
+    return response
+
 ###fafana rehefa uploaded###
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
+        if request.path == '/api/getcoords':
+            return _deprecated_getcoords_response()
+
         res = make_response()
         res.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
         res.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
@@ -1495,36 +1506,8 @@ def give_info(current_user):
 @app.route('/api/getcoords', methods=['GET', 'POST', 'OPTIONS'])
 @token_required
 def get_coords(current_user):
-    """Get map data for authenticated user"""
-    data = request.get_json()
-    received_value = data.get('data')
-    try:
-        # Example: fetch locations from Supabase that belong to the user
-        result = supabase.table('main_parcels').select('*').eq('uuid', received_value).execute() #changer pour la table profile
-        ##new adds##
-        account = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
-        profile_data = account.data[0]
-        profile_type = profile_data.get("account")
-        if profile_type != "free":
-
-            return jsonify({
-                'success': True,
-                'data': result.data
-            }), 200
-
-        else:
-            return jsonify({
-                'success' : True,
-                'data': result.data,
-                'message' : 'Upgrade your account'
-            }), 200
-
-    except Exception as e:
-        print(f"Map data error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'message': f'Failed to fetch map data: {str(e)}'
-        }), 500
+    """Deprecated endpoint retained temporarily for compatibility."""
+    return _deprecated_getcoords_response()
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
