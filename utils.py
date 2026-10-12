@@ -23,6 +23,156 @@ import time
 logger = logging.getLogger(__name__)
 
 
+_BATCH_CACHE_TTL = {
+    "opentopodata": 30 * 24 * 60 * 60,
+    "soilgrids": 30 * 24 * 60 * 60,
+    "nasa_power": 24 * 60 * 60,
+    "overpass": 6 * 60 * 60,
+}
+
+
+def _has_valid_overpass_elements(data):
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("elements"), list)
+        and all(isinstance(element, dict) for element in data["elements"])
+    )
+
+
+def _has_error_marker(data):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            normalized_key = str(key).lower().replace("-", "_")
+            if normalized_key in {"error", "errors", "error_message"} and value:
+                return True
+            if normalized_key in {"status", "status_code"}:
+                if isinstance(value, str) and value.strip().lower() in {
+                    "error", "failed", "failure"
+                }:
+                    return True
+                if isinstance(value, int) and value >= 400:
+                    return True
+            if _has_error_marker(value):
+                return True
+    elif isinstance(data, list):
+        return any(_has_error_marker(item) for item in data)
+    return False
+
+
+def _has_valid_elevations(data):
+    results = data.get("results") if isinstance(data, dict) else None
+    return (
+        isinstance(results, list)
+        and bool(results)
+        and all(
+            isinstance(result, dict)
+            and isinstance(result.get("elevation"), (int, float))
+            and not isinstance(result.get("elevation"), bool)
+            and math.isfinite(result["elevation"])
+            for result in results
+        )
+    )
+
+
+def _has_valid_soil_layers(data):
+    properties = data.get("properties") if isinstance(data, dict) else None
+    layers = properties.get("layers") if isinstance(properties, dict) else None
+    if not isinstance(layers, list) or not layers:
+        return False
+
+    has_numeric_value = False
+    for layer in layers:
+        if not isinstance(layer, dict) or not isinstance(layer.get("name"), str):
+            return False
+        unit_measure = layer.get("unit_measure")
+        depths = layer.get("depths")
+        if (
+            not isinstance(unit_measure, dict)
+            or not isinstance(unit_measure.get("mapped_units"), str)
+            or not isinstance(depths, list)
+            or not depths
+            or not isinstance(depths[0], dict)
+            or not isinstance(depths[0].get("values"), dict)
+            or "mean" not in depths[0]["values"]
+        ):
+            return False
+
+        value = depths[0]["values"].get("mean")
+        if value is not None:
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+            ):
+                return False
+            has_numeric_value = True
+
+    return has_numeric_value
+
+
+def _has_valid_nasa_power_parameters(data):
+    properties = data.get("properties") if isinstance(data, dict) else None
+    parameters = properties.get("parameter") if isinstance(properties, dict) else None
+    if (
+        not isinstance(parameters, dict)
+        or not parameters
+        or not all(isinstance(values, dict) for values in parameters.values())
+        or not next(iter(parameters.values()))
+    ):
+        return False
+
+    validators = {
+        "PRECTOTCORR": lambda value: value >= 0,
+        "T2M": lambda value: value > -999,
+        "T2M_MAX": lambda value: value > -999,
+        "T2M_MIN": lambda value: value > -999,
+    }
+    for name, is_usable in validators.items():
+        values = parameters.get(name)
+        if not isinstance(values, dict) or not values:
+            return False
+        if not any(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and is_usable(value)
+            for value in values.values()
+        ):
+            return False
+    return True
+
+
+def _is_cacheable_batch_response(response):
+    """Cache only successful, valid JSON payloads from batch data services."""
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+
+    if _has_error_marker(data):
+        return False
+
+    response_url = (response.url or "").lower()
+    if "api.opentopodata.org" in response_url:
+        return _has_valid_elevations(data)
+    if "rest.isric.org/soilgrids/" in response_url:
+        return _has_valid_soil_layers(data)
+    if "power.larc.nasa.gov" in response_url:
+        return _has_valid_nasa_power_parameters(data)
+    if "overpass" in response_url:
+        return _has_valid_overpass_elements(data)
+    return False
+
+
+_batch_session = requests_cache.CachedSession(
+    ".georeport_batch_cache",
+    expire_after=_BATCH_CACHE_TTL["opentopodata"],
+    allowable_methods=("GET",),
+    allowable_codes=(200,),
+    filter_fn=_is_cacheable_batch_response,
+)
+
+
 def get_terrain_slope(lat, lon, distance=30):
     # 1. Calculate the 8 surrounding points
     # 1 degree of lat approx 111,320 meters
@@ -45,7 +195,11 @@ def get_terrain_slope(lat, lon, distance=30):
     locations_str = "|".join([f"{p[0]},{p[1]}" for p in points])
     url = f"https://api.opentopodata.org/v1/srtm90m?locations={locations_str}"
     
-    response = requests.get(url, timeout=(5, 10))
+    response = _batch_session.get(
+        url,
+        timeout=(5, 10),
+        expire_after=_BATCH_CACHE_TTL["opentopodata"],
+    )
     response.raise_for_status()
     response_data = response.json()
     elevations = [r['elevation'] for r in response_data['results']]
@@ -85,7 +239,12 @@ def get_soil_data(longitude, latitude):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=(5, 15))
+        response = _batch_session.get(
+            url,
+            params=params,
+            timeout=(5, 15),
+            expire_after=_BATCH_CACHE_TTL["soilgrids"],
+        )
         response.raise_for_status()
         data = response.json()
         for i in data["properties"]["layers"]:
@@ -106,7 +265,11 @@ def get_elevation(longitude, latitude):
     open_topo_api = "https://api.opentopodata.org/v1/srtm90m?locations={},{}&interpolation=cubic&format=json".format(latitude, longitude)
     try:
         # Send the GET request
-        response = requests.get(open_topo_api, timeout=(5, 10))
+        response = _batch_session.get(
+            open_topo_api,
+            timeout=(5, 10),
+            expire_after=_BATCH_CACHE_TTL["opentopodata"],
+        )
         response.raise_for_status()
         
         # Parse the JSON response
@@ -511,7 +674,11 @@ def season_analysis(longitude, latitude):
     )
 
     print(f"  Fetching NASA POWER data for ({latitude}, {longitude})...")
-    resp = requests.get(url, timeout=(5, 30))
+    resp = _batch_session.get(
+        url,
+        timeout=(5, 30),
+        expire_after=_BATCH_CACHE_TTL["nasa_power"],
+    )
     resp.raise_for_status()
     raw = resp.json()
 
@@ -629,15 +796,16 @@ def query_overpass(query):
     servers = OVERPASS_SERVERS[:3]
     for server_index, server in enumerate(servers):
         try:
-            response = requests.get(
+            response = _batch_session.get(
                 server,
                 params={"data": query},
                 timeout=(5, 15),
                 headers={"User-Agent": "ProximityChecker/1.0"},
+                expire_after=_BATCH_CACHE_TTL["overpass"],
             )
             response.raise_for_status()
             data = response.json()
-            if not isinstance(data, dict) or not isinstance(data.get("elements"), list):
+            if not _has_valid_overpass_elements(data):
                 raise ValueError("Invalid Overpass response structure")
             return data
         except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
