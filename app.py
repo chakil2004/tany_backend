@@ -292,9 +292,8 @@ def register():
     """Register a new user using Supabase Auth"""
     data = request.get_json()
 
-    # Validate required fields
-    #required_fields = ['email', 'password', 'name', 'username', 'mobile', 'address', 'idCard', 'account']
-    required_fields = ['email', 'password', 'name', 'username', 'mobile',  'account']
+    # account remains accepted from legacy clients but is not trusted.
+    required_fields = ['email', 'password', 'name', 'username', 'mobile']
     for field in required_fields:
         if not data or not data.get(field):
             return jsonify({
@@ -309,7 +308,7 @@ def register():
     mobile = data['mobile']
     #address = data['address']
     #id_card = data['idCard']
-    account_type = data['account']
+    account_type = 'free'
 
     try:
         # Check if username already exists in profiles table
@@ -1155,22 +1154,20 @@ def get_info(xy):
 @app.route('/api/get_infos', methods=['GET', 'POST'])
 @token_required
 def great_info(current_user):
+    if current_user.get("account") != "pro":
+        return jsonify({
+            'success': False,
+            'message': 'A Pro account is required to access this GeoReport'
+        }), 403
+
     data = request.get_json()
     try:
         uuid_p = data.get("data")
         result = supabase.table('georeport').select('*').eq("uuid_parcel", uuid_p).execute()
-        account = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
-        profile_type = account.data[0]["account"]
-        if profile_type != "free":
-            return jsonify({
-                'success': True,
-                'data': result.data
-            }), 200
-        else:
-            return jsonify({
-            'success': False,
-            'message': f'account free is not allowed'
-            }), 500
+        return jsonify({
+            'success': True,
+            'data': result.data
+        }), 200
     except Exception as e:
         print(f"Map data error: {str(e)}")
         return jsonify({
@@ -1183,24 +1180,21 @@ def great_info(current_user):
 @app.route('/api/get_infos_', methods=['GET', 'POST', 'OPTIONS'])
 @token_required
 def give_info(current_user):
+    if current_user.get("account") != "pro":
+        return jsonify({
+            'success': False,
+            'message': 'A Pro account is required to access this GeoReport'
+        }), 403
+
     data = request.get_json() #format {"longitude": xx.xx , "latitude" : xx.xx}
-    account = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
-    profile_data = account.data[0]
-    profile_type = profile_data.get("account")
     try:
         results = get_info(data.get("data"))
         print(results)
-        if profile_type != "free":
-            return jsonify({
-                    'success': True,
-                    'data': results,
-                    'balise' : data.get("data")
-                }), 200
-        else:
-            return jsonify({
-                'success' : False,
-                'message' : 'Upgrade your account'
-            }), 500
+        return jsonify({
+                'success': True,
+                'data': results,
+                'balise' : data.get("data")
+            }), 200
     except Exception as e:
         return jsonify({
             'success': False,
