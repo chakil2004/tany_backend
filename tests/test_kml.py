@@ -1,5 +1,6 @@
 from io import BytesIO
 import json
+import math
 import os
 
 import pytest
@@ -100,6 +101,84 @@ def fail_temp_file_write(app_module, monkeypatch):
         lambda *args, **kwargs: FailingWriteFile(*args, **kwargs),
     )
     return paths
+
+
+def inserted_parcel(fake_supabase, index=-1):
+    inserts = [
+        call['payload'] for call in fake_supabase.calls
+        if call['table'] == 'main_parcels' and call['operation'] == 'insert'
+    ]
+    return inserts[index]
+
+
+def assert_valid_metadata(stored):
+    assert 'longitude' in stored
+    assert 'latitude' in stored
+    assert 'area_ha' in stored
+    assert stored['area_ha'] > 0
+    assert -180 <= stored['longitude'] <= 180
+    assert -90 <= stored['latitude'] <= 90
+
+
+def test_polygon_upload_stores_centroid_area_and_geojson_text(
+    client, fake_supabase, bearer_headers
+):
+    fake_supabase.queue_response('main_parcels', 'insert', [{'id': 41}])
+
+    response = post_kml(client, bearer_headers, kml_document(polygon()))
+
+    assert response.status_code == 200
+    stored = inserted_parcel(fake_supabase)
+    assert_valid_metadata(stored)
+    assert stored['longitude'] == pytest.approx(47.5)
+    assert stored['latitude'] == pytest.approx(-17.5)
+    assert isinstance(stored['geojson'], str)
+    assert json.loads(stored['geojson'])['type'] == 'Polygon'
+
+
+def test_polygon_hole_reduces_geodesic_area(
+    client, fake_supabase, bearer_headers
+):
+    fake_supabase.queue_response('main_parcels', 'insert', [{'id': 45}])
+    fake_supabase.queue_response('main_parcels', 'insert', [{'id': 46}])
+
+    without_hole = post_kml(client, bearer_headers, kml_document(polygon()))
+    with_hole = post_kml(
+        client,
+        bearer_headers,
+        kml_document(polygon(holes=[VALID_HOLE])),
+    )
+
+    assert without_hole.status_code == with_hole.status_code == 200
+    solid_area = inserted_parcel(fake_supabase, 0)['area_ha']
+    holed_area = inserted_parcel(fake_supabase, 1)['area_ha']
+    assert 0 < holed_area < solid_area
+
+
+def test_multipolygon_sums_component_areas_and_stores_finite_centroid(
+    client, fake_supabase, bearer_headers
+):
+    fake_supabase.queue_response('main_parcels', 'insert', [{'id': 47}])
+    fake_supabase.queue_response('main_parcels', 'insert', [{'id': 48}])
+    single_response = post_kml(client, bearer_headers, kml_document(polygon()))
+    multi_response = post_kml(
+        client,
+        bearer_headers,
+        kml_document(
+            f'<Placemark>{polygon()}</Placemark>',
+            f'<Placemark>{polygon(VALID_OUTER_2)}</Placemark>',
+        ),
+    )
+
+    assert single_response.status_code == multi_response.status_code == 200
+    single = inserted_parcel(fake_supabase, 0)
+    multi = inserted_parcel(fake_supabase, 1)
+    assert_valid_metadata(multi)
+    assert multi['area_ha'] > single['area_ha']
+    assert math.isfinite(multi['longitude'])
+    assert math.isfinite(multi['latitude'])
+    assert isinstance(multi['geojson'], str)
+    assert json.loads(multi['geojson'])['type'] == 'MultiPolygon'
 
 
 def test_valid_polygon_upload_preserves_holes_and_ignores_forged_owner_uuid(

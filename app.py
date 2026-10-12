@@ -11,11 +11,15 @@ from flask import make_response
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import tempfile
-from shapely.geometry import shape
+from pyproj import Geod
+from shapely.geometry import MultiPolygon, Polygon, shape
 from shapely.errors import ShapelyError
+from shapely.geometry.polygon import orient
 from shapely.ops import transform
 import geojson
 from werkzeug.exceptions import RequestEntityTooLarge
+
+GEOD = Geod(ellps="WGS84")
 
 load_dotenv()
 
@@ -750,6 +754,61 @@ class InvalidKmlInput(ValueError):
     """An uploaded KML document or parcel geometry is invalid."""
 
 
+def calculate_kml_area_ha(geometry):
+    """Calculate geodesic WGS84 area in hectares for Polygon geometries."""
+    if not isinstance(geometry, (Polygon, MultiPolygon)):
+        raise InvalidKmlInput('KML geometry must be a Polygon or MultiPolygon')
+    if geometry.is_empty or not geometry.is_valid:
+        raise InvalidKmlInput('KML polygon geometry is invalid')
+
+    polygons = [geometry] if isinstance(geometry, Polygon) else list(geometry.geoms)
+    area_m2 = 0.0
+    for polygon in polygons:
+        # Geod uses signed ring areas. Normalize a temporary copy so its shell
+        # is counter-clockwise and its holes are clockwise; stored GeoJSON is
+        # left untouched.
+        oriented_polygon = orient(polygon, sign=1.0)
+        polygon_area_m2, _ = GEOD.geometry_area_perimeter(oriented_polygon)
+        area_m2 += abs(polygon_area_m2)
+
+    area_ha = area_m2 / 10_000
+    if not math.isfinite(area_ha) or area_ha <= 0:
+        raise InvalidKmlInput('KML polygon area is invalid')
+    return area_ha
+
+
+def _calculate_kml_parcel_metadata(geojson_geometry):
+    """Derive validated centroid coordinates and geodesic area from KML GeoJSON."""
+    try:
+        geometry = shape(geojson_geometry)
+    except (TypeError, ValueError, ShapelyError) as error:
+        raise InvalidKmlInput('KML polygon geometry is invalid') from error
+
+    if (
+        not isinstance(geometry, (Polygon, MultiPolygon))
+        or geometry.is_empty
+        or not geometry.is_valid
+    ):
+        raise InvalidKmlInput('KML polygon geometry is invalid')
+
+    centroid = geometry.centroid
+    longitude = float(centroid.x)
+    latitude = float(centroid.y)
+    if (
+        not math.isfinite(longitude)
+        or not math.isfinite(latitude)
+        or not -180 <= longitude <= 180
+        or not -90 <= latitude <= 90
+    ):
+        raise InvalidKmlInput('KML polygon centroid is invalid')
+
+    return {
+        'longitude': longitude,
+        'latitude': latitude,
+        'area_ha': calculate_kml_area_ha(geometry),
+    }
+
+
 def _request_too_large_response():
     return jsonify({
         'status': 'error',
@@ -945,6 +1004,9 @@ def store_parcel_in_supabase(form_data, geojson_geometry):
             'price_m2': form_data.get('price_m2'),
             'price': form_data.get('price'),
             'currency' : form_data.get('currency'),
+            'longitude': form_data['longitude'],
+            'latitude': form_data['latitude'],
+            'area_ha': form_data['area_ha'],
             'geojson': json.dumps(geojson_geometry),  # Store as JSON string
             'created_at': datetime.utcnow().isoformat(),
             #'updated_at': datetime.utcnow().isoformat()
@@ -1062,6 +1124,8 @@ def upload_kml(current_user):
 
         if not geojson_geometry:
             raise InvalidKmlInput('KML file contains no valid polygon geometry')
+
+        form_data.update(_calculate_kml_parcel_metadata(geojson_geometry))
 
         # Store data in Supabase table.
         result = store_parcel_in_supabase(form_data, geojson_geometry)
