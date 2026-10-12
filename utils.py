@@ -45,8 +45,10 @@ def get_terrain_slope(lat, lon, distance=30):
     locations_str = "|".join([f"{p[0]},{p[1]}" for p in points])
     url = f"https://api.opentopodata.org/v1/srtm90m?locations={locations_str}"
     
-    response = requests.get(url).json()
-    elevations = [r['elevation'] for r in response['results']]
+    response = requests.get(url, timeout=(5, 10))
+    response.raise_for_status()
+    response_data = response.json()
+    elevations = [r['elevation'] for r in response_data['results']]
     
     center_elev = elevations[0]
     surrounding_elevs = elevations[1:]
@@ -83,8 +85,8 @@ def get_soil_data(longitude, latitude):
     }
 
     try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()  # Raise an exception for bad status codes
+        response = requests.get(url, params=params, timeout=(5, 15))
+        response.raise_for_status()
         data = response.json()
         for i in data["properties"]["layers"]:
             #print(i["name"])
@@ -104,9 +106,7 @@ def get_elevation(longitude, latitude):
     open_topo_api = "https://api.opentopodata.org/v1/srtm90m?locations={},{}&interpolation=cubic&format=json".format(latitude, longitude)
     try:
         # Send the GET request
-        response = requests.get(open_topo_api)
-        
-        # Raise an exception if the request was unsuccessful
+        response = requests.get(open_topo_api, timeout=(5, 10))
         response.raise_for_status()
         
         # Parse the JSON response
@@ -131,7 +131,13 @@ def get_elevation(longitude, latitude):
 
 def _build_client() -> openmeteo_requests.Client:
     session = requests_cache.CachedSession(".openmeteo_cache", expire_after=3600)
-    session = retry(session, retries=5, backoff_factor=0.4)
+    session = retry(
+        session,
+        retries=1,
+        backoff_factor=0.25,
+        status_to_retry=(408, 429, 500, 502, 503, 504),
+        respect_retry_after_header=False,
+    )
     return openmeteo_requests.Client(session=session)
 
 
@@ -153,7 +159,9 @@ def _fetch_discharge(lat: float, lon: float, start: str, end: str):
         "end_date": end,
     }
     responses = _om_client.weather_api(
-        "https://flood-api.open-meteo.com/v1/flood", params=params
+        "https://flood-api.open-meteo.com/v1/flood",
+        params=params,
+        timeout=(5, 20),
     )
     response = responses[0]
     daily = response.Daily()
@@ -503,7 +511,7 @@ def season_analysis(longitude, latitude):
     )
 
     print(f"  Fetching NASA POWER data for ({latitude}, {longitude})...")
-    resp = requests.get(url, timeout=120)
+    resp = requests.get(url, timeout=(5, 30))
     resp.raise_for_status()
     raw = resp.json()
 
@@ -617,26 +625,25 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
-def query_overpass(query, retries=3):
-    for server in OVERPASS_SERVERS:
-        for attempt in range(retries):
-            try:
-                response = requests.get(
-                    server,
-                    params={"data": query},
-                    timeout=30,
-                    headers={"User-Agent": "ProximityChecker/1.0"},
-                )
-                if response.status_code == 429:
-                    time.sleep(10)
-                    continue
-                if response.status_code != 200 or not response.text.strip():
-                    break
-                return response.json()
-            except requests.exceptions.Timeout:
-                time.sleep(2)
-            except requests.exceptions.JSONDecodeError:
-                break
+def query_overpass(query):
+    servers = OVERPASS_SERVERS[:3]
+    for server_index, server in enumerate(servers):
+        try:
+            response = requests.get(
+                server,
+                params={"data": query},
+                timeout=(5, 15),
+                headers={"User-Agent": "ProximityChecker/1.0"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("elements"), list):
+                raise ValueError("Invalid Overpass response structure")
+            return data
+        except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
+            logger.warning("Overpass request failed for %s: %s", server, exc)
+            if server_index < len(servers) - 1:
+                time.sleep(0.25)
     return None
 
 
