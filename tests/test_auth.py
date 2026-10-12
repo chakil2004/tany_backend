@@ -103,3 +103,32 @@ def test_current_user_email_fallback_uses_supabase_auth(
     assert response.get_json()["data"]["email"] == TEST_EMAIL
     # token_required validates once; the fallback retrieves the verified email.
     assert len(verified_tokens) == 2
+
+
+def test_account_returns_account_with_explicit_projection(
+    client, fake_supabase, bearer_headers
+):
+    fake_supabase.queue_response(
+        "profiles",
+        "select",
+        [{"uuid": TEST_USER_ID, "email": TEST_EMAIL, "account": "pro"}],
+    )
+    fake_supabase.queue_response(
+        "profiles",
+        "select",
+        [{"account": "pro", "email": TEST_EMAIL, "address": "Private address"}],
+    )
+
+    response = client.get("/api/account", headers=bearer_headers())
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["data"][0]["account"] == "pro"
+    assert body["data"] == [{"account": "pro"}]
+
+    account_query = next(
+        call
+        for call in fake_supabase.calls
+        if call["table"] == "profiles" and ("email", TEST_EMAIL) in call["filters"]
+    )
+    assert account_query["columns"] == "account"

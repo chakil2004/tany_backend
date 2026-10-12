@@ -567,7 +567,10 @@ def get_market(current_user):
     """Get map data for authenticated user"""
     try:
         # Example: fetch locations from Supabase that belong to the user
-        result = supabase.table('main_parcels').select('*').eq('sell_category', 'to_sell').execute() #changer pour la table profile
+        result = supabase.table('main_parcels').select(
+            'id,uuid,owner,parcel_name,price,price_m2,currency,location_name,'
+            'description,area_ha,geojson,created_at'
+        ).eq('sell_category', 'to_sell').execute() #changer pour la table profile
         #result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
 
 
@@ -676,7 +679,7 @@ def get_map_account(current_user):
     try:
         # Example: fetch locations from Supabase that belong to the user
         #result = supabase.table('main_parcels').select('*').eq('owner_uuid', current_user['email']).execute() #changer pour la table profile
-        result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+        result = supabase.table('profiles').select('account').eq('email', current_user['email']).execute() #changer pour la table profile
         return jsonify({
             'success': True,
             'data': result.data
