@@ -542,17 +542,27 @@ def get_objects(current_user):
 
 # Example: Get user's map data (protected route)
 @app.route('/api/getprodd', methods=['GET', 'POST'])
-def get_product():
-    """Get map data for authenticated user"""
-    data = request.get_json()
-    print(data)
-    received_value = data.get('data')
-    print(received_value)
-    try:
-        # Example: fetch locations from Supabase that belong to the user
-        result = supabase.table('main_parcels').select('*').eq('uuid', received_value).execute() #changer pour la table profile
-        #result = supabase.table('profiles').select('*').eq('email', current_user['email']).execute() #changer pour la table profile
+@token_required
+def get_product(current_user):
+    """Get a published marketplace listing by UUID."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'message': 'A JSON object is required'}), 400
 
+    received_value = data.get('data')
+    if not isinstance(received_value, str) or not received_value.strip():
+        return jsonify({'success': False, 'message': 'A parcel UUID is required'}), 400
+
+    try:
+        result = (
+            supabase.table('main_parcels')
+            .select('uuid,owner,owner_uuid,parcel_name,description,price,currency,price_m2,location_name,sell_category,status_category')
+            .eq('uuid', received_value)
+            .eq('sell_category', 'to_sell')
+            .execute()
+        )
+        if not result.data:
+            return jsonify({'success': False, 'message': 'Marketplace listing not found'}), 404
 
         return jsonify({
             'success': True,
@@ -560,10 +570,10 @@ def get_product():
         }), 200
 
     except Exception as e:
-        print(f"Map data error: {str(e)}")
+        print(f"Marketplace product lookup error: {str(e)}")
         return jsonify({
             'success': False,
-            'message': f'Failed to fetch map data: {str(e)}'
+            'message': 'Failed to fetch marketplace listing'
         }), 500
 
 # Example: Get user's map data (protected route)
@@ -1239,9 +1249,25 @@ def great_info(current_user):
             'message': 'A Pro account is required to access this GeoReport'
         }), 403
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'message': 'A JSON object is required'}), 400
+
+    uuid_p = data.get("data")
+    if not isinstance(uuid_p, str) or not uuid_p.strip():
+        return jsonify({'success': False, 'message': 'A parcel UUID is required'}), 400
+
     try:
-        uuid_p = data.get("data")
+        parcel = (
+            supabase.table('main_parcels')
+            .select('uuid')
+            .eq('uuid', uuid_p)
+            .eq('sell_category', 'to_sell')
+            .execute()
+        )
+        if not parcel.data:
+            return jsonify({'success': False, 'message': 'Marketplace listing not found'}), 404
+
         result = supabase.table('georeport').select('*').eq("uuid_parcel", uuid_p).execute()
         return jsonify({
             'success': True,
