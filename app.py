@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from functools import wraps
 import os
+import math
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import json
@@ -11,8 +12,10 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 import tempfile
 from shapely.geometry import shape
+from shapely.errors import ShapelyError
 from shapely.ops import transform
 import geojson
+from werkzeug.exceptions import RequestEntityTooLarge
 
 load_dotenv()
 
@@ -733,106 +736,198 @@ def refresh_token():
         return jsonify({'success': False, 'message': 'The authentication service is temporarily unavailable'}), 503
 
 # Configure upload settings
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MiB
+MAX_MULTIPART_OVERHEAD = 256 * 1024
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE + MAX_MULTIPART_OVERHEAD
 ALLOWED_EXTENSIONS = {'kml'}
+KML_NAMESPACE = 'http://www.opengis.net/kml/2.2'
 
 def allowed_file(filename):
-    return '.' in filename and \
+    return isinstance(filename, str) and '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def coordinates_to_geojson(coords_text, geometry_type):
-    """Convert KML coordinates to GeoJSON format"""
-    if not coords_text:
+class InvalidKmlInput(ValueError):
+    """An uploaded KML document or parcel geometry is invalid."""
+
+
+def _request_too_large_response():
+    return jsonify({
+        'status': 'error',
+        'message': 'Request exceeds the maximum allowed size'
+    }), 413
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_entity_too_large(_error):
+    return _request_too_large_response()
+
+
+def _local_xml_name(element):
+    tag = element.tag
+    return tag.rsplit('}', 1)[-1] if isinstance(tag, str) else ''
+
+
+def _xml_namespace(element):
+    tag = element.tag
+    if not isinstance(tag, str) or not tag.startswith('{'):
         return None
+    return tag[1:].split('}', 1)[0]
 
-    coords_text = coords_text.strip()
 
+def _parse_kml_ring(coords_text):
+    if not isinstance(coords_text, str) or not coords_text.strip():
+        raise InvalidKmlInput('KML polygon ring is empty')
+
+    positions = []
+    for coordinate_text in coords_text.split():
+        components = coordinate_text.split(',')
+        if len(components) not in (2, 3):
+            raise InvalidKmlInput('KML coordinate must contain longitude, latitude, and optional altitude')
+        try:
+            values = [float(component) for component in components]
+        except (TypeError, ValueError, OverflowError) as error:
+            raise InvalidKmlInput('KML coordinates must be numeric') from error
+
+        if not all(math.isfinite(value) for value in values):
+            raise InvalidKmlInput('KML coordinates must be finite')
+
+        longitude, latitude = values[:2]
+        if not -180 <= longitude <= 180:
+            raise InvalidKmlInput('KML longitude is outside WGS84 bounds')
+        if not -90 <= latitude <= 90:
+            raise InvalidKmlInput('KML latitude is outside WGS84 bounds')
+        positions.append([longitude, latitude])
+
+    if len(positions) < 4:
+        raise InvalidKmlInput('KML polygon ring must contain at least four positions')
+    if positions[0] != positions[-1]:
+        raise InvalidKmlInput('KML polygon ring must be closed')
+    if len({tuple(position) for position in positions[:-1]}) < 3:
+        raise InvalidKmlInput('KML polygon ring must contain at least three distinct vertices')
+
+    return positions
+
+
+def _validate_kml_geometry(geometry):
     try:
-        if geometry_type == 'Point':
-            # Point coordinates: "long,lat[,alt]"
-            coords = coords_text.split(',')
-            if len(coords) >= 2:
-                lon, lat = float(coords[0]), float(coords[1])
-                return {
-                    'type': 'Point',
-                    'coordinates': [lon, lat]
-                }
+        parsed_geometry = shape(geometry)
+    except (TypeError, ValueError, ShapelyError) as error:
+        raise InvalidKmlInput('KML polygon geometry is invalid') from error
 
-        elif geometry_type == 'LineString':
-            # LineString coordinates: "lon1,lat1[,alt1] lon2,lat2[,alt2] ..."
-            coordinates = []
-            for coord_set in coords_text.split():
-                coords = coord_set.split(',')
-                if len(coords) >= 2:
-                    lon, lat = float(coords[0]), float(coords[1])
-                    coordinates.append([lon, lat])
-            if coordinates:
-                return {
-                    'type': 'LineString',
-                    'coordinates': coordinates
-                }
+    if parsed_geometry.is_empty or not parsed_geometry.is_valid:
+        raise InvalidKmlInput('KML polygon geometry is invalid')
 
-        elif geometry_type == 'Polygon':
-            # Polygon coordinates: "lon1,lat1[,alt1] lon2,lat2[,alt2] ..."
-            coordinates = []
-            for coord_set in coords_text.split():
-                coords = coord_set.split(',')
-                if len(coords) >= 2:
-                    lon, lat = float(coords[0]), float(coords[1])
-                    coordinates.append([lon, lat])
-            if coordinates:
-                # Close the polygon by repeating the first point
-                if coordinates[0] != coordinates[-1]:
-                    coordinates.append(coordinates[0])
-                return {
-                    'type': 'Polygon',
-                    'coordinates': [coordinates]
-                }
 
-    except (ValueError, IndexError) as e:
-        app.logger.warning("KML coordinate parsing failed (%s)", type(e).__name__)
-        return None
+def coordinates_to_geojson(coords_text, geometry_type):
+    """Convert one KML polygon ring to validated GeoJSON."""
+    if geometry_type != 'Polygon':
+        raise InvalidKmlInput('Only polygon geometries are accepted')
 
-    return None
+    geometry = {
+        'type': 'Polygon',
+        'coordinates': [_parse_kml_ring(coords_text)]
+    }
+    _validate_kml_geometry(geometry)
+    return geometry
+
+
+def _parse_kml_boundary_ring(boundary):
+    linear_rings = [child for child in boundary if _local_xml_name(child) == 'LinearRing']
+    if len(linear_rings) != 1:
+        raise InvalidKmlInput('KML polygon boundary must contain one LinearRing')
+
+    coordinate_elements = [
+        child for child in linear_rings[0]
+        if _local_xml_name(child) == 'coordinates'
+    ]
+    if len(coordinate_elements) != 1:
+        raise InvalidKmlInput('KML LinearRing must contain one coordinates element')
+    return _parse_kml_ring(coordinate_elements[0].text)
+
+
+def _parse_kml_polygon(polygon):
+    outer_boundaries = [
+        child for child in polygon if _local_xml_name(child) == 'outerBoundaryIs'
+    ]
+    inner_boundaries = [
+        child for child in polygon if _local_xml_name(child) == 'innerBoundaryIs'
+    ]
+    if len(outer_boundaries) != 1:
+        raise InvalidKmlInput('KML polygon must have exactly one outer boundary')
+
+    coordinates = [_parse_kml_boundary_ring(outer_boundaries[0])]
+    coordinates.extend(_parse_kml_boundary_ring(boundary) for boundary in inner_boundaries)
+    geometry = {'type': 'Polygon', 'coordinates': coordinates}
+    _validate_kml_geometry(geometry)
+    return geometry
+
+
+_UNSUPPORTED_KML_GEOMETRIES = {
+    'Point', 'LineString', 'LinearRing', 'Model', 'Track', 'MultiTrack'
+}
+
+
+def _collect_kml_polygons(element):
+    tag = _local_xml_name(element)
+    if tag == 'Polygon':
+        return [_parse_kml_polygon(element)]
+    if tag in _UNSUPPORTED_KML_GEOMETRIES:
+        raise InvalidKmlInput('Only Polygon geometries are accepted')
+    if tag == 'MultiGeometry':
+        children = list(element)
+        if not children or any(
+            _local_xml_name(child) not in {'Polygon', 'MultiGeometry'}
+            for child in children
+        ):
+            raise InvalidKmlInput('KML MultiGeometry may contain only Polygon geometries')
+        polygons = []
+        for child in children:
+            polygons.extend(_collect_kml_polygons(child))
+        if not polygons:
+            raise InvalidKmlInput('KML MultiGeometry contains no polygons')
+        return polygons
+
+    polygons = []
+    for child in list(element):
+        polygons.extend(_collect_kml_polygons(child))
+    return polygons
+
+
+def _reject_xml_declarations(file_content):
+    # KML does not need DTD or custom entities. Ignore NUL bytes so UTF-16
+    # encodings cannot bypass this check.
+    normalized_content = file_content.replace(b'\x00', b'').upper()
+    if b'<!DOCTYPE' in normalized_content or b'<!ENTITY' in normalized_content:
+        raise InvalidKmlInput('DTD and entity declarations are not accepted')
+
 
 def parse_kml_file(file_path):
-    """Parse KML file and extract the first polygon geometry (for land parcels)"""
+    """Parse and validate all polygon geometries in a KML document."""
     try:
         tree = ET.parse(file_path)
-        root = tree.getroot()
+    except ET.ParseError as error:
+        raise InvalidKmlInput('KML contains invalid XML') from error
 
-        # Define namespaces for KML
-        namespaces = {
-            'kml': 'http://www.opengis.net/kml/2.2'
-        }
+    root = tree.getroot()
+    if (
+        _local_xml_name(root) != 'kml'
+        or _xml_namespace(root) != KML_NAMESPACE
+    ):
+        raise InvalidKmlInput('XML document is not a KML document')
 
-        # Look for Polygon geometries (most common for land parcels)
-        polygon = root.find('.//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates', namespaces)
-        if polygon is not None and polygon.text:
-            geojson = coordinates_to_geojson(polygon.text.strip(), 'Polygon')
-            if geojson:
-                return geojson
+    polygons = _collect_kml_polygons(root)
+    if not polygons:
+        raise InvalidKmlInput('KML document contains no polygon geometry')
 
-        # If no polygon found, try to find any geometry
-        geometries = [
-            ('.//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates', 'Polygon'),
-            ('.//kml:LineString/kml:coordinates', 'LineString'),
-            ('.//kml:Point/kml:coordinates', 'Point')
-        ]
+    if len(polygons) == 1:
+        return polygons[0]
 
-        for xpath, geom_type in geometries:
-            element = root.find(xpath, namespaces)
-            if element is not None and element.text:
-                geojson = coordinates_to_geojson(element.text.strip(), geom_type)
-                if geojson:
-                    return geojson
-
-        return None
-
-    except ET.ParseError as e:
-        raise ValueError(f"Invalid KML file: {str(e)}")
-    except Exception as e:
-        raise ValueError(f"Error parsing KML file: {str(e)}")
+    geometry = {
+        'type': 'MultiPolygon',
+        'coordinates': [polygon['coordinates'] for polygon in polygons]
+    }
+    _validate_kml_geometry(geometry)
+    return geometry
 
 def store_parcel_in_supabase(form_data, geojson_geometry):
     """Store parcel data with GeoJSON geometry in existing table"""
@@ -887,6 +982,7 @@ def store_parcel_in_supabase(form_data, geojson_geometry):
 @token_required
 def upload_kml(current_user):
     """Handle KML file upload with parcel information"""
+    temp_file_path = None
     try:
         owner_email = current_user.get('email') if isinstance(current_user, dict) else None
         if not isinstance(owner_email, str) or not owner_email.strip():
@@ -943,61 +1039,58 @@ def upload_kml(current_user):
                 }), 400
 
         # Read file content
-        file_content = file.read()
+        file_content = file.stream.read(MAX_FILE_SIZE + 1)
 
         # Check file size
         if len(file_content) > MAX_FILE_SIZE:
             return jsonify({
                 'status': 'error',
-                'message': f'File size exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit'
-            }), 400
+                'message': 'File size exceeds the 10 MiB limit'
+            }), 413
+        if not file_content:
+            raise InvalidKmlInput('KML file is empty')
+
+        _reject_xml_declarations(file_content)
 
         # Create temporary file for parsing
         with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as temp_file:
-            temp_file.write(file_content)
             temp_file_path = temp_file.name
+            temp_file.write(file_content)
 
-        try:
-            # Parse KML file and extract geometry as GeoJSON
-            geojson_geometry = parse_kml_file(temp_file_path)
+        # Parse and validate polygon geometry as GeoJSON.
+        geojson_geometry = parse_kml_file(temp_file_path)
 
-            if not geojson_geometry:
-                return jsonify({
-                    'status': 'error',
-                    'message': 'No valid geometry found in KML file'
-                }), 400
+        if not geojson_geometry:
+            raise InvalidKmlInput('KML file contains no valid polygon geometry')
 
-            # Store data in Supabase table
-            result = store_parcel_in_supabase(form_data, geojson_geometry)
+        # Store data in Supabase table.
+        result = store_parcel_in_supabase(form_data, geojson_geometry)
 
-            if result['status'] == 'success':
-                return jsonify({
-                    'status': 'success',
-                    'message': result['message'],
-                    'data': {
-                        'record_id': result['record_id'],
-                        'parcel_name': form_data['parcel_name'],
-                        'geometry_type': geojson_geometry.get('type', 'Unknown')
-                    }
-                }), 200
-            else:
-                app.logger.error("KML parcel persistence failed")
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Failed to store parcel'
-                }), 500
-
-        except ValueError as e:
-            app.logger.warning("KML parsing failed (%s)", type(e).__name__)
+        if result['status'] == 'success':
             return jsonify({
-                'status': 'error',
-                'message': 'Invalid KML file or geometry'
-            }), 400
+                'status': 'success',
+                'message': result['message'],
+                'data': {
+                    'record_id': result['record_id'],
+                    'parcel_name': form_data['parcel_name'],
+                    'geometry_type': geojson_geometry.get('type', 'Unknown')
+                }
+            }), 200
 
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+        app.logger.error("KML parcel persistence failed")
+        return jsonify({
+            'status': 'error',
+            'message': 'Failed to store parcel'
+        }), 500
+
+    except RequestEntityTooLarge:
+        return _request_too_large_response()
+    except InvalidKmlInput as error:
+        app.logger.warning("KML input rejected (%s)", type(error).__name__)
+        return jsonify({
+            'status': 'error',
+            'message': 'Invalid KML file or geometry'
+        }), 400
 
     except Exception:
         app.logger.exception("KML upload failed")
@@ -1005,6 +1098,17 @@ def upload_kml(current_user):
             'status': 'error',
             'message': 'Failed to upload parcel'
         }), 500
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                app.logger.error(
+                    "KML temporary file cleanup failed (%s)",
+                    type(error).__name__
+                )
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
