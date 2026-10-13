@@ -933,14 +933,47 @@ class get_all_infos:
             logger.warning("Could not parse OpenTopoData elevation response")
         
         #slopes
+        value.update({
+            "max_slope": None,
+            "avg_slope": None,
+            "individual_slopes": [],
+        })
         try:
             slopes = get_terrain_slope(self.latitude, self.longitude, distance=30)
-            value.update(slopes)
-            ers["slopes"] = "ok!"
+            individual_slopes = (
+                slopes.get("individual_slopes")
+                if isinstance(slopes, dict)
+                else None
+            )
+            slope_is_valid = (
+                isinstance(slopes, dict)
+                and isinstance(slopes.get("max_slope"), (int, float))
+                and not isinstance(slopes.get("max_slope"), bool)
+                and math.isfinite(slopes["max_slope"])
+                and isinstance(slopes.get("avg_slope"), (int, float))
+                and not isinstance(slopes.get("avg_slope"), bool)
+                and math.isfinite(slopes["avg_slope"])
+                and isinstance(individual_slopes, list)
+                and bool(individual_slopes)
+                and all(
+                    isinstance(slope, (int, float))
+                    and not isinstance(slope, bool)
+                    and math.isfinite(slope)
+                    for slope in individual_slopes
+                )
+            )
+            if slope_is_valid:
+                value.update(slopes)
+                ers["slopes"] = "ok!"
+            else:
+                ers["slopes"] = "OpenTopoData returned no valid slope data"
+                logger.warning("OpenTopoData slope returned no valid numeric data")
         except requests.exceptions.RequestException as e:
             logger.warning("OpenTopoData slope request failed (%s)", type(e).__name__)
-            #value.update(balise)
             ers["slopes"] = f"An error occurred in slopes: {e}"
+        except (ValueError, TypeError):
+            logger.warning("Could not calculate OpenTopoData slope from the response")
+            ers["slopes"] = "Could not calculate slope data from the response. (ValueError, TypeError)"
         except (KeyError, IndexError):
             logger.warning("Could not parse OpenTopoData slope response")
             ers["slopes"] = "Could not parse slopes data from the response. (KeyError, IndexError)"
@@ -1025,6 +1058,7 @@ class get_all_infos:
             logger.warning("Could not parse flood risk response")
 
         #climate
+        value["climates"] = None
         try:
             climate = season_analysis(self.longitude, self.latitude)
             value["climates"] = climate
@@ -1032,6 +1066,9 @@ class get_all_infos:
         except requests.exceptions.RequestException as e:
             logger.warning("NASA POWER climate request failed (%s)", type(e).__name__)
             ers["climates"] = f"An error occurred in climates: {e}"
+        except (ValueError, TypeError):
+            logger.warning("NASA POWER climate calculation failed")
+            ers["climates"] = "NASA POWER climate data is unavailable or insufficient"
         except (KeyError, IndexError):
             logger.warning("Could not parse NASA POWER climate response")
             ers["climates"] = "Could not parse climates data from the response. (KeyError, IndexError)"
