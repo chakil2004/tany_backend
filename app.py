@@ -24,10 +24,23 @@ GEOD = Geod(ellps="WGS84")
 load_dotenv()
 
 app = Flask(__name__)
-#CORS(app)  # Enable CORS for frontend requests
-CORS(app, origins=["http://127.0.0.1:5500", "http://127.0.0.1:5501", "http://localhost:5500", "http://localhost:5501", "https://tany-main-v1-b0gt2r9v5-michel-raherimanantsoas-projects.vercel.app", "https://tany-main-v1.vercel.app", "https://tany-main-v1-o52dpd7ax-michel-raherimanantsoas-projects.vercel.app", "https://tany-main-v1-jp8zipbm9-michel-raherimanantsoas-projects.vercel.app","https://michelheriman.github.io/tany_main_v1/", "https://michelheriman.github.io", "https://tany-main-v1-git-main-michel-raherimanantsoas-projects.vercel.app", "https://tanylandrustv2.vercel.app"], supports_credentials=True)
-# OR for more specific control:
-#CORS(app, resources={r"/api/*": {"origins": "http://127.0.0.1:5500"}})
+ALLOWED_FRONTEND_ORIGINS = [
+    "http://127.0.0.1:5500",
+    "http://127.0.0.1:5501",
+    "http://localhost:5500",
+    "http://localhost:5501",
+]
+CORS(
+    app,
+    resources={
+        r"/api/*": {"origins": ALLOWED_FRONTEND_ORIGINS},
+        r"/export/kml": {"origins": ALLOWED_FRONTEND_ORIGINS},
+    },
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    supports_credentials=False,
+    max_age=3600,
+)
 
 def _deprecated_getcoords_response():
     response = make_response(jsonify({
@@ -36,22 +49,6 @@ def _deprecated_getcoords_response():
     }), 410)
     response.headers['Deprecation'] = 'true'
     return response
-
-###fafana rehefa uploaded###
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        if request.path == '/api/getcoords':
-            return _deprecated_getcoords_response()
-
-        res = make_response()
-        res.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-        res.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        res.headers['Access-Control-Max-Age'] = '3600'
-        res.status_code = 200
-        return res
-############################
 
 basedir = os.path.abspath(os.path.dirname(__file__))
 # Join it with the .env filename
@@ -69,10 +66,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # --- FIX STARTS HERE ---
         if request.method == 'OPTIONS':
-            return f(None, *args, **kwargs) # Pass None as current_user for OPTIONS
-        # --- FIX ENDS HERE ---
+            return f(None, *args, **kwargs)
+
         auth_header = request.headers.get('Authorization')
 
         if not auth_header:
@@ -132,12 +128,9 @@ def check_username():
         app.logger.exception("Username availability lookup failed")
         return jsonify({"error": "Internal server error"}), 500
 
-@app.route('/api/parcels_w', methods=['POST', 'OPTIONS'])
+@app.route('/api/parcels_w', methods=['POST'])
 @token_required
 def draw_parcels(current_user):
-    if request.method == 'OPTIONS':
-        return jsonify({'success': True}), 200
-
     owner_email = current_user.get('email') if isinstance(current_user, dict) else None
     if not isinstance(owner_email, str) or not owner_email.strip():
         return jsonify({'success': False, 'message': 'Authenticated profile has no email'}), 403
@@ -187,12 +180,9 @@ def draw_parcels(current_user):
             "message": "Failed to create parcel"
         }), 500
 
-@app.route('/api/messages_w', methods=['POST', 'OPTIONS'])
+@app.route('/api/messages_w', methods=['POST'])
 @token_required
 def write_messages(current_user):
-    if request.method == 'OPTIONS':
-        return jsonify({'success': True}), 200
-
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({'success': False, 'message': 'A JSON object is required'}), 400
@@ -1616,7 +1606,7 @@ def great_info(current_user):
 
 '''end of the new fetching '''
 
-@app.route('/api/get_infos_', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/api/get_infos_', methods=['GET', 'POST'])
 @token_required
 def give_info(current_user):
     if current_user.get("account") != "pro":
